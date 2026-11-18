@@ -1,0 +1,10 @@
+/target
+**/target
+node_modules
+dist
+out
+.DS_Store
+templates-src/*
+!templates-src/.gitkeep
+src-tauri/target
+src-tauri/gen

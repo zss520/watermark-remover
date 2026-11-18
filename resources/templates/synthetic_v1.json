@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "synthetic_v1",
+  "displayName": "合成示例水印",
+  "version": 1,
+  "quality": "pixel",
+  "blendMode": "source_over",
+  "colorSpace": "srgb",
+  "color": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "alphaMap": "alpha_maps/synthetic_v1.png",
+  "alphaDepth": 16,
+  "alphaSha256": "1e1bac07d056bbf2a8ec25455f543afc09156562866a10d51d60cd90729ffef0",
+  "placement": {
+    "anchor": "bottom-right",
+    "sizeBasis": "min-side",
+    "widthRatio": 0.2,
+    "aspect": 2.0,
+    "marginX": 0.0,
+    "marginY": 0.0,
+    "subpixel": [
+      0.0,
+      0.0
+    ],
+    "minWidthPx": 48,
+    "paddingPx": 4
+  },
+  "alphaStableMax": 0.8,
+  "minImageSize": [
+    256,
+    256
+  ],
+  "nccAuto": 0.85,
+  "nccConfirm": 0.6
+}

@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Local image processing. No network permission.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
