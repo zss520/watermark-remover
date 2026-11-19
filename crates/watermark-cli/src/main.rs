@@ -3,9 +3,9 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use watermark_core::{
-    calibrate_to_dir, decode_bytes, decode_path, load_template_dir, load_template_embedded, load_template_file,
-    process_best, verify_pairs, CalibrateRequest, InputImage, LoadedTemplate, ProcessOptions, ProcessOutput, Verdict,
-    VerifyReport,
+    calibrate_to_dir, decode_bytes, decode_path, load_template_dir, load_template_embedded_parts, load_template_file,
+    process_best, read_template_files, verify_pairs, CalibrateRequest, InputImage, LoadedTemplate, ProcessOptions,
+    ProcessOutput, Verdict, VerifyReport,
 };
 
 #[derive(Parser)]
@@ -39,6 +39,9 @@ struct CalibrateArgs {
     black: Vec<PathBuf>,
     #[arg(long = "gray")]
     gray: Vec<PathBuf>,
+    /// 第三张平涂，RGB 192。用来拟合带描边的水印
+    #[arg(long = "light")]
+    light: Vec<PathBuf>,
     #[arg(long)]
     out: PathBuf,
 }
@@ -115,19 +118,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_calibrate(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let blacks = load_images(&args.black)?;
     let grays = load_images(&args.gray)?;
+    let lights = load_images(&args.light)?;
     let summary = calibrate_to_dir(
         &CalibrateRequest {
             id: args.id,
             display_name: args.name,
             blacks,
             grays,
+            lights,
         },
         &args.out,
     )?;
-    println!(
-        "色彩空间 {}，灰图 MAE {:.3}，最大误差 {}，模板 {} 个",
-        summary.color_space, summary.gray_mae, summary.gray_max, summary.template_count
-    );
+    if summary.affine {
+        println!(
+            "仿射 sRGB，浅灰残差 MAE {:.3}，最大误差 {}，模板 {} 个，质量保持视觉级",
+            summary.gray_mae, summary.gray_max, summary.template_count
+        );
+    } else {
+        println!(
+            "色彩空间 {}，灰图 MAE {:.3}，最大误差 {}，模板 {} 个",
+            summary.color_space, summary.gray_mae, summary.gray_max, summary.template_count
+        );
+    }
     if !summary.model_ok {
         eprintln!("模型未通过灰图门禁，未作为 pixel 模板发布");
         std::process::exit(2);
@@ -368,6 +380,8 @@ fn serve(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
             (200, "{\"ok\":true}".into())
         } else if url.starts_with("/api/sample") {
             (200, sample_payload())
+        } else if url.starts_with("/api/templates") {
+            (200, templates_payload())
         } else if url.starts_with("/api/process") && method == tiny_http::Method::Post {
             (200, handle_process(&body))
         } else {
@@ -403,7 +417,16 @@ fn demo_template() -> Result<LoadedTemplate, String> {
     let mut meta = demo.template.meta;
     meta.alpha_sha256 = watermark_core::sha256_hex(&png);
     let json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-    load_template_embedded(&json, &png).map_err(|e| e.to_string())
+    load_template_embedded_parts(&json, &png, None).map_err(|e| e.to_string())
+}
+
+fn load_part(json: &str, alpha_b64: &str, bias_b64: Option<&str>) -> Result<LoadedTemplate, String> {
+    let alpha = decode_b64(alpha_b64)?;
+    let bias = match bias_b64 {
+        Some(text) if !text.trim().is_empty() => Some(decode_b64(text)?),
+        _ => None,
+    };
+    load_template_embedded_parts(json, &alpha, bias.as_deref()).map_err(|e| e.to_string())
 }
 
 fn load_request_templates(req: &ProcessBody) -> Result<Vec<LoadedTemplate>, String> {
@@ -411,18 +434,49 @@ fn load_request_templates(req: &ProcessBody) -> Result<Vec<LoadedTemplate>, Stri
         if !list.is_empty() {
             let mut out = Vec::new();
             for part in list {
-                let alpha = decode_b64(&part.alpha_base64)?;
-                out.push(load_template_embedded(&part.template_json, &alpha).map_err(|e| e.to_string())?);
+                out.push(load_part(&part.template_json, &part.alpha_base64, part.bias_base64.as_deref())?);
             }
             return Ok(out);
         }
     }
     match (&req.template_json, &req.alpha_base64) {
-        (Some(json), Some(alpha)) => {
-            let alpha = decode_b64(alpha)?;
-            Ok(vec![load_template_embedded(json, &alpha).map_err(|e| e.to_string())?])
-        }
+        (Some(json), Some(alpha)) => Ok(vec![load_part(json, alpha, req.bias_base64.as_deref())?]),
         _ => Ok(vec![demo_template()?]),
+    }
+}
+
+fn bundled_template_dir() -> Option<PathBuf> {
+    ["resources/doubao", "../resources/doubao"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|dir| dir.join("template_1024x1024.json").is_file())
+}
+
+fn templates_payload() -> String {
+    let Some(dir) = bundled_template_dir() else {
+        return serde_json::json!({ "templates": [], "note": "没有找到豆包模板目录" }).to_string();
+    };
+    match read_template_files(&dir) {
+        Ok(files) => {
+            let templates: Vec<_> = files
+                .into_iter()
+                .map(|part| {
+                    serde_json::json!({
+                        "templateJson": part.json,
+                        "alphaBase64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, part.alpha),
+                        "biasBase64": part.bias.as_ref().map(|bytes| {
+                            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+                        }),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "templates": templates,
+                "note": "已载入豆包各尺寸模板。质量是视觉级，留出验证没有把它标成像素级。"
+            })
+            .to_string()
+        }
+        Err(err) => serde_json::json!({ "templates": [], "error": err.to_string() }).to_string(),
     }
 }
 
@@ -446,6 +500,7 @@ fn sample_payload() -> String {
 struct TemplatePart {
     template_json: String,
     alpha_base64: String,
+    bias_base64: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -454,6 +509,7 @@ struct ProcessBody {
     image_base64: String,
     template_json: Option<String>,
     alpha_base64: Option<String>,
+    bias_base64: Option<String>,
     templates: Option<Vec<TemplatePart>>,
     accept: Option<bool>,
     jpeg: Option<bool>,

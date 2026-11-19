@@ -59,6 +59,12 @@ export interface SampleResponse {
 export interface TemplateBundle {
   templateJson: string;
   alphaBase64: string;
+  biasBase64?: string;
+}
+
+export interface TemplateListResponse {
+  templates: TemplateBundle[];
+  note: string;
 }
 
 async function inTauri(): Promise<boolean> {
@@ -88,6 +94,10 @@ async function call<T>(command: string, path: string, body?: unknown): Promise<T
 
 export function fetchSample(): Promise<SampleResponse> {
   return call("sample_image", "/api/sample");
+}
+
+export function fetchTemplates(): Promise<TemplateListResponse> {
+  return call("list_templates", "/api/templates");
 }
 
 export function processImage(body: {

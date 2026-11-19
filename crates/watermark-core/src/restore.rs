@@ -82,13 +82,24 @@ pub fn process_best(
     if templates.is_empty() {
         return Err(Error::Template("没有可用模板".into()));
     }
-    if templates.len() == 1 || opt.manual_bbox.is_some() || opt.no_watermark {
-        return process_one(input, &templates[0], opt);
-    }
-    let mut scored: Vec<(f32, usize)> = templates
+    let dims = [input.rgba.width(), input.rgba.height()];
+    let matched: Vec<usize> = templates
         .iter()
         .enumerate()
-        .map(|(i, t)| (locate(&input.rgba, t).ncc, i))
+        .filter(|(_, t)| t.meta.source_size == Some(dims))
+        .map(|(i, _)| i)
+        .collect();
+    let pool: Vec<usize> = if matched.is_empty() {
+        (0..templates.len()).collect()
+    } else {
+        matched
+    };
+    if pool.len() == 1 || opt.manual_bbox.is_some() || opt.no_watermark {
+        return process_one(input, &templates[pool[0]], opt);
+    }
+    let mut scored: Vec<(f32, usize)> = pool
+        .iter()
+        .map(|&i| (locate(&input.rgba, &templates[i]).ncc, i))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let best = scored[0];
@@ -144,7 +155,7 @@ fn restore_match(
     }
 
     let place = found.placement.clone().ok_or_else(|| Error::Template("没有放置结果".into()))?;
-    let (mut image, counts, coverage, probe) = invert(input, template, &place, &found.alpha);
+    let (mut image, counts, coverage, probe) = invert(input, template, &place, &found.alpha, &found.bias);
     let outside = outside_diff(&input.rgba, &image, &coverage);
     // The inverter only writes evaluation-mask pixels. A non-zero diff means
     // the invariant broke; drop the pixels and fail the report.
@@ -249,6 +260,7 @@ fn invert(
     template: &LoadedTemplate,
     place: &Placement,
     alpha: &[f32],
+    bias: &[f32],
 ) -> (RgbaImage, Counts, Coverage, Probe) {
     let x0 = place.origin_x.floor() as i32;
     let y0 = place.origin_y.floor() as i32;
@@ -259,6 +271,7 @@ fn invert(
     let mode = template.meta.blend_mode;
     let space = template.meta.color_space;
     let wm = template.meta.color;
+    let use_bias = bias.len() == alpha.len() && !bias.is_empty();
 
     let (eval, ex, ey, ew, eh) = dilate(alpha, x0, y0, w, h, pad, input.rgba.width(), input.rgba.height());
 
@@ -296,19 +309,40 @@ fn invert(
             let idx = ((y as u32 * input.rgba.width() + x as u32) * 4) as usize;
             let mut pixel_unstable = false;
             let mut pixel_clamped = false;
-            for c in 0..3 {
-                let inv = inverse_u8(raw_in[idx + c], a, wm[c], mode, space);
-                if inv.numeric_unstable {
+            if use_bias {
+                let k = bias[(py * w + px) as usize];
+                let m = 1.0 - a;
+                if m < 1e-3 {
                     pixel_unstable = true;
-                    raw_out[idx + c] = raw_in[idx + c];
                 } else {
                     if a > stable_max {
                         pixel_unstable = true;
                     }
-                    if inv.clamped {
-                        pixel_clamped = true;
+                    for c in 0..3 {
+                        let src = (raw_in[idx + c] as f32 - k) / m;
+                        if !src.is_finite() || src < 0.0 || src > 255.0 {
+                            pixel_clamped = true;
+                        }
+                        if src.is_finite() {
+                            raw_out[idx + c] = src.round().clamp(0.0, 255.0) as u8;
+                        }
                     }
-                    raw_out[idx + c] = inv.value;
+                }
+            } else {
+                for c in 0..3 {
+                    let inv = inverse_u8(raw_in[idx + c], a, wm[c], mode, space);
+                    if inv.numeric_unstable {
+                        pixel_unstable = true;
+                        raw_out[idx + c] = raw_in[idx + c];
+                    } else {
+                        if a > stable_max {
+                            pixel_unstable = true;
+                        }
+                        if inv.clamped {
+                            pixel_clamped = true;
+                        }
+                        raw_out[idx + c] = inv.value;
+                    }
                 }
             }
             if a > 0.02 {

@@ -1,17 +1,25 @@
 use crate::blend::{forward_u8, BlendMode};
 use crate::color::{srgb_to_linear, ColorSpace};
-use crate::template::{encode_alpha16, sample_alpha, sha256_hex, PlacementSpec, Quality, Template};
+use crate::template::{encode_alpha16, encode_bias16, sample_alpha, sha256_hex, PlacementSpec, Quality, Template};
 use crate::Error;
 use image::RgbaImage;
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
+/// Gap between the strongest negative (0.434, box shifted 16 px) and the
+/// weakest real positive (0.520) on the Doubao photo sets. Both NCC cuts
+/// sit inside that gap, so a blank photo stays unsupported and a real
+/// stamp is restored. Quality stays visual either way.
+const AFFINE_NCC: f32 = 0.48;
+
 pub struct CalibrateRequest {
     pub id: String,
     pub display_name: String,
     pub blacks: Vec<RgbaImage>,
     pub grays: Vec<RgbaImage>,
+    /// Third known flat color, RGB 192. Present when the watermark is not one white layer.
+    pub lights: Vec<RgbaImage>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +29,7 @@ pub struct CalibrateSummary {
     pub gray_mae: f32,
     pub gray_max: u8,
     pub template_count: usize,
+    pub affine: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -41,6 +50,7 @@ struct SizeReport {
     gray_mae: f32,
     gray_max: u8,
     template_id: String,
+    affine: bool,
 }
 
 #[derive(Serialize)]
@@ -72,15 +82,20 @@ pub fn calibrate_to_dir(req: &CalibrateRequest, out_dir: &Path) -> Result<Calibr
     for (w, h) in groups {
         let blacks: Vec<&RgbaImage> = req.blacks.iter().filter(|i| i.dimensions() == (w, h)).collect();
         let grays: Vec<&RgbaImage> = req.grays.iter().filter(|i| i.dimensions() == (w, h)).collect();
+        let lights: Vec<&RgbaImage> = req.lights.iter().filter(|i| i.dimensions() == (w, h)).collect();
         if grays.is_empty() {
             continue;
         }
-        let built = build_one(&req.id, &req.display_name, &blacks, &grays)?;
+        let built = if lights.is_empty() {
+            build_one(&blacks, &grays)?
+        } else {
+            build_affine(&blacks, &grays, &lights)?
+        };
         all_candidates.extend(built.candidates.clone());
         let suffix = if group_count == 1 {
             String::new()
         } else {
-            format!("_w{w}")
+            format!("_{w}x{h}")
         };
         let id = format!("{}{suffix}", req.id);
         let alpha_name = format!("alpha{suffix}.png");
@@ -91,10 +106,19 @@ pub fn calibrate_to_dir(req: &CalibrateRequest, out_dir: &Path) -> Result<Calibr
         };
         let png = encode_alpha16(&built.alpha, built.aw, built.ah)?;
         let hash = sha256_hex(&png);
+        let (bias_map, bias_sha256) = if let Some(bias) = &built.bias {
+            let bias_name = format!("bias{suffix}.png");
+            let bias_png = encode_bias16(bias, built.aw, built.ah)?;
+            let bias_hash = sha256_hex(&bias_png);
+            fs::write(out_dir.join(&bias_name), &bias_png)?;
+            (Some(bias_name), Some(bias_hash))
+        } else {
+            (None, None)
+        };
         let template = Template {
             schema_version: 1,
             id: id.clone(),
-            display_name: req.display_name.clone(),
+            display_name: format!("{} {w}×{h}", req.display_name),
             version: 1,
             quality: Quality::Visual,
             blend_mode: BlendMode::SourceOver,
@@ -103,11 +127,14 @@ pub fn calibrate_to_dir(req: &CalibrateRequest, out_dir: &Path) -> Result<Calibr
             alpha_map: alpha_name.clone(),
             alpha_depth: 16,
             alpha_sha256: hash,
+            bias_map,
+            bias_sha256,
             placement: built.placement,
             alpha_stable_max: 0.80,
             min_image_size: [256, 256],
-            ncc_auto: 0.85,
-            ncc_confirm: 0.60,
+            ncc_auto: if built.bias.is_some() { AFFINE_NCC } else { 0.85 },
+            ncc_confirm: if built.bias.is_some() { AFFINE_NCC } else { 0.60 },
+            source_size: Some([w, h]),
         };
         fs::write(out_dir.join(&alpha_name), &png)?;
         fs::write(
@@ -125,6 +152,7 @@ pub fn calibrate_to_dir(req: &CalibrateRequest, out_dir: &Path) -> Result<Calibr
             gray_mae: built.mae,
             gray_max: built.max_err,
             template_id: id,
+            affine: built.bias.is_some(),
         });
     }
     if sizes.is_empty() {
@@ -149,6 +177,7 @@ pub fn calibrate_to_dir(req: &CalibrateRequest, out_dir: &Path) -> Result<Calibr
         gray_mae: first.gray_mae,
         gray_max: first.gray_max,
         template_count: sizes.len(),
+        affine: sizes.iter().any(|s| s.affine),
     })
 }
 
@@ -162,10 +191,10 @@ struct Built {
     model_ok: bool,
     placement: PlacementSpec,
     candidates: Vec<CandidateReport>,
+    bias: Option<Vec<f32>>,
 }
 
-fn build_one(id: &str, _name: &str, blacks: &[&RgbaImage], grays: &[&RgbaImage]) -> Result<Built, Error> {
-    let _ = id;
+fn build_one(blacks: &[&RgbaImage], grays: &[&RgbaImage]) -> Result<Built, Error> {
     let reference = blacks[0];
     let (iw, ih) = reference.dimensions();
     let aligned: Vec<Vec<f32>> = blacks
@@ -241,7 +270,121 @@ fn build_one(id: &str, _name: &str, blacks: &[&RgbaImage], grays: &[&RgbaImage])
         model_ok,
         placement,
         candidates,
+        bias: None,
     })
+}
+
+/// Fit `C = K + M·B` in sRGB code values from black, gray 128, and gray 192.
+/// Alpha stored for the locator is `1 - M`. Bias stores `K`.
+fn build_affine(blacks: &[&RgbaImage], grays: &[&RgbaImage], lights: &[&RgbaImage]) -> Result<Built, Error> {
+    let reference = blacks[0];
+    let (iw, ih) = reference.dimensions();
+    let black_stack: Vec<Vec<f32>> = blacks.iter().map(|img| align_code(reference, img)).collect();
+    let black = median_luma(&black_stack, iw, ih);
+    let gray_stack: Vec<Vec<f32>> = if grays.len() == 1 {
+        vec![code_luma(grays[0])]
+    } else {
+        grays.iter().map(|g| align_code(grays[0], g)).collect()
+    };
+    let gray = median_luma(&gray_stack, iw, ih);
+    let light_stack: Vec<Vec<f32>> = if lights.len() == 1 {
+        vec![code_luma(lights[0])]
+    } else {
+        lights.iter().map(|g| align_code(lights[0], g)).collect()
+    };
+    let light = median_luma(&light_stack, iw, ih);
+    let mut mask = vec![0.0f32; black.len()];
+    for i in 0..black.len() {
+        if !flat_pixel(black[i], gray[i], light[i]) {
+            mask[i] = 1.0;
+        }
+    }
+    let (x, y, bw, bh) = support_bbox(&mask, iw, ih, 0.5).ok_or_else(|| Error::Template("平涂图上看不到水印".into()))?;
+    let mut alpha = Vec::with_capacity((bw * bh) as usize);
+    let mut bias = Vec::with_capacity((bw * bh) as usize);
+    let mut sum = 0.0f32;
+    let mut n = 0.0f32;
+    let mut max_err = 0u8;
+    for py in 0..bh {
+        for px in 0..bw {
+            let i = ((y + py) * iw + x + px) as usize;
+            if mask[i] == 0.0 {
+                alpha.push(0.0);
+                bias.push(0.0);
+                continue;
+            }
+            let (k, m) = fit_km(black[i], gray[i], light[i]);
+            let a = (1.0 - m).clamp(0.0, 1.0);
+            alpha.push(a);
+            bias.push(k);
+            let pred = (k + m * 192.0).round().clamp(0.0, 255.0);
+            let err = (pred - light[i].round()).abs() as u8;
+            max_err = max_err.max(err);
+            sum += err as f32;
+            n += 1.0;
+        }
+    }
+    let mae = if n == 0.0 { 99.0 } else { sum / n };
+    let mside = iw.min(ih) as f32;
+    let placement = PlacementSpec {
+        anchor: "bottom-right".into(),
+        size_basis: "min-side".into(),
+        width_ratio: bw as f32 / mside,
+        aspect: bw as f32 / bh as f32,
+        margin_x: (iw as f32 - x as f32 - bw as f32) / mside,
+        margin_y: (ih as f32 - y as f32 - bh as f32) / mside,
+        subpixel: [0.0, 0.0],
+        min_width_px: 48,
+        padding_px: 4,
+    };
+    Ok(Built {
+        alpha,
+        aw: bw,
+        ah: bh,
+        space: ColorSpace::Srgb,
+        mae,
+        max_err,
+        model_ok: mae <= 2.0 && max_err <= 6,
+        placement,
+        candidates: vec![CandidateReport {
+            space: "affine-srgb".into(),
+            mae,
+            max: max_err,
+        }],
+        bias: Some(bias),
+    })
+}
+
+fn flat_pixel(black: f32, gray: f32, light: f32) -> bool {
+    (black - 0.0).abs() < 0.51 && (gray - 128.0).abs() < 0.51 && (light - 192.0).abs() < 0.51
+}
+
+fn fit_km(y0: f32, y1: f32, y2: f32) -> (f32, f32) {
+    const S1: f32 = 3.0;
+    const SX: f32 = 320.0;
+    const SXX: f32 = 53248.0;
+    const DET: f32 = S1 * SXX - SX * SX;
+    let sy = y0 + y1 + y2;
+    let sxy = 128.0 * y1 + 192.0 * y2;
+    let k = (sy * SXX - SX * sxy) / DET;
+    let m = (S1 * sxy - SX * sy) / DET;
+    (k, m)
+}
+
+fn code_luma(image: &RgbaImage) -> Vec<f32> {
+    image
+        .pixels()
+        .map(|p| (p.0[0] as f32 + p.0[1] as f32 + p.0[2] as f32) / 3.0)
+        .collect()
+}
+
+fn align_code(reference: &RgbaImage, image: &RgbaImage) -> Vec<f32> {
+    if image.dimensions() != reference.dimensions() || std::ptr::eq(reference, image) {
+        return code_luma(reference);
+    }
+    // Plates of one color share a pixel grid. A luma shift would lock onto
+    // the background instead of the watermark.
+    code_luma(image)
 }
 
 fn subpixel(alpha: &[f32], gray: &[f32], w: u32, h: u32, space: ColorSpace) -> (f32, f32, f32, u8) {

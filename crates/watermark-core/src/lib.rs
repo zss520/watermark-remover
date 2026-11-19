@@ -30,8 +30,8 @@ pub use restore::{
     composite_alpha, outside_diff as restore_outside_for_test, process_best, process_one, ProcessOptions, ProcessOutput,
 };
 pub use template::{
-    encode_alpha16, load_template_dir, load_template_embedded, load_template_file, sha256_hex, LoadedTemplate, Quality,
-    Template,
+    encode_alpha16, load_template_dir, load_template_embedded, load_template_embedded_parts, load_template_file,
+    read_template_files, sha256_hex, LoadedTemplate, Quality, Template, TemplateFiles,
 };
 pub use verify::{verify_pairs, VerifyReport};
 

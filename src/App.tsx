@@ -7,6 +7,7 @@ import {
   base64ToObjectUrl,
   bytesToBase64,
   fetchSample,
+  fetchTemplates,
   fileToBase64,
   processImage,
   type Probe,
@@ -29,7 +30,7 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [dropping, setDropping] = useState(false);
   const [error, setError] = useState("");
-  const [note, setNote] = useState("未选择模板时使用合成示例。它不是豆包或千问的真实水印。");
+  const [note, setNote] = useState("正在查找本机的豆包模板。");
   const [jpeg, setJpeg] = useState(false);
   const [keepExif, setKeepExif] = useState(false);
   const [manual, setManual] = useState(false);
@@ -54,6 +55,29 @@ export function App() {
   const drag = useRef<{ x: number; y: number } | null>(null);
   const draftRef = useRef<Box | null>(null);
   const pending = useRef<(() => void) | null>(null);
+  const customTemplates = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchTemplates()
+      .then((list) => {
+        if (cancelled || customTemplates.current) return;
+        if (list.templates.length === 0) {
+          setNote("未选择模板时使用合成示例。它不是豆包或千问的真实水印。");
+          return;
+        }
+        setTemplates(list.templates);
+        setNote(list.note);
+      })
+      .catch(() => {
+        if (!cancelled && !customTemplates.current) {
+          setNote("未选择模板时使用合成示例。它不是豆包或千问的真实水印。");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const node = dirInput.current;
@@ -137,6 +161,7 @@ export function App() {
   }
 
   async function loadSample() {
+    customTemplates.current = true;
     setError("");
     setBusy(true);
     try {
@@ -167,37 +192,60 @@ export function App() {
     setError("");
   }
 
-  async function onTemplate(jsonFile: File | undefined, alphaFile: File | undefined) {
+  async function onTemplate(jsonFile: File | undefined, alphaFile: File | undefined, biasFile: File | undefined) {
     if (!jsonFile || !alphaFile) {
       setError("请同时选择模板 JSON 和 Alpha PNG");
       return;
     }
+    const text = await jsonFile.text();
+    let needsBias = false;
+    try {
+      needsBias = Boolean((JSON.parse(text) as { biasMap?: string }).biasMap);
+    } catch {
+      setError("模板 JSON 无法解析");
+      return;
+    }
+    if (needsBias && !biasFile) {
+      setError("这个模板带仿射偏置，请再选择 Bias PNG");
+      return;
+    }
+    customTemplates.current = true;
     const alpha = new Uint8Array(await alphaFile.arrayBuffer());
-    setTemplates([{ templateJson: await jsonFile.text(), alphaBase64: bytesToBase64(alpha) }]);
+    const bias = biasFile ? bytesToBase64(new Uint8Array(await biasFile.arrayBuffer())) : undefined;
+    setTemplates([{ templateJson: text, alphaBase64: bytesToBase64(alpha), biasBase64: bias }]);
     setNote(`已载入模板 ${jsonFile.name}`);
     setError("");
   }
 
   async function onTemplateDir(files: FileList | null) {
     if (!files || files.length === 0) return;
+    customTemplates.current = true;
     const list = Array.from(files);
     const bundles: TemplateBundle[] = [];
     for (const json of list.filter((file) => file.name.toLowerCase().endsWith(".json"))) {
       const text = await json.text();
       let alphaName = json.name.replace(/\.json$/i, ".png");
       try {
-        const parsed = JSON.parse(text) as { alphaMap?: string };
+        const parsed = JSON.parse(text) as { alphaMap?: string; biasMap?: string };
         const mapped = parsed.alphaMap?.split(/[/\\]/).pop();
         if (mapped) alphaName = mapped;
+        const biasName = parsed.biasMap?.split(/[/\\]/).pop();
+        const alpha = list.find((file) => file.name === alphaName);
+        if (!alpha) continue;
+        if (biasName && !list.some((file) => file.name === biasName)) {
+          setError(`缺少偏置贴图 ${biasName}`);
+          return;
+        }
+        const bias = biasName ? list.find((file) => file.name === biasName) : undefined;
+        bundles.push({
+          templateJson: text,
+          alphaBase64: bytesToBase64(new Uint8Array(await alpha.arrayBuffer())),
+          biasBase64: bias ? bytesToBase64(new Uint8Array(await bias.arrayBuffer())) : undefined,
+        });
+        continue;
       } catch {
         continue;
       }
-      const alpha = list.find((file) => file.name === alphaName);
-      if (!alpha) continue;
-      bundles.push({
-        templateJson: text,
-        alphaBase64: bytesToBase64(new Uint8Array(await alpha.arrayBuffer())),
-      });
     }
     if (bundles.length === 0) {
       setError("目录里没有成对的模板 JSON 和 Alpha PNG");
@@ -399,7 +447,22 @@ export function App() {
             onChange={() => {
               const json = document.querySelector<HTMLInputElement>("#template-json")?.files?.[0];
               const alpha = document.querySelector<HTMLInputElement>("#template-alpha")?.files?.[0];
-              void onTemplate(json, alpha);
+              const bias = document.querySelector<HTMLInputElement>("#template-bias")?.files?.[0];
+              void onTemplate(json, alpha, bias);
+            }}
+          />
+        </label>
+        <label className="file">
+          Bias PNG
+          <input
+            id="template-bias"
+            type="file"
+            accept="image/png"
+            onChange={() => {
+              const json = document.querySelector<HTMLInputElement>("#template-json")?.files?.[0];
+              const alpha = document.querySelector<HTMLInputElement>("#template-alpha")?.files?.[0];
+              const bias = document.querySelector<HTMLInputElement>("#template-bias")?.files?.[0];
+              if (json && alpha) void onTemplate(json, alpha, bias);
             }}
           />
         </label>
@@ -550,7 +613,7 @@ function ReportView({ report }: { report: Report }) {
   const quality = report.qualityClaim === "pixel"
     ? "像素级（以该模板的留出验证为准）"
     : report.qualityClaim === "visual"
-      ? "已按模板逆运算"
+      ? "视觉级"
       : "—";
   const rows: Array<[string, string]> = [
     ["判决", VERDICT_LABEL[report.verdict]],

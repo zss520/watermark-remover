@@ -5,7 +5,7 @@
 
 use crate::blend::BlendMode;
 use crate::placement::{place_loaded, Placement};
-use crate::template::{rasterize_alpha, LoadedTemplate};
+use crate::template::{rasterize_alpha, rasterize_plane, LoadedTemplate};
 use image::RgbaImage;
 
 #[derive(Debug, Clone)]
@@ -16,6 +16,8 @@ pub struct Match {
     pub shift: [i32; 2],
     pub placement: Option<Placement>,
     pub alpha: Vec<f32>,
+    /// Affine bias K in code values, parallel to `alpha`. Empty for a uniform color.
+    pub bias: Vec<f32>,
 }
 
 impl Match {
@@ -27,6 +29,7 @@ impl Match {
             shift: [0, 0],
             placement: None,
             alpha: Vec::new(),
+            bias: Vec::new(),
         }
     }
 }
@@ -37,6 +40,7 @@ pub fn locate(image: &RgbaImage, template: &LoadedTemplate) -> Match {
     };
     let (fx, fy) = base.frac();
     let alpha = rasterize_alpha(template, base.width, base.height, fx, fy);
+    let bias = raster_bias(template, base.width, base.height, fx, fy);
     let mut best: Option<Match> = None;
     for dy in -4..=4 {
         for dx in -4..=4 {
@@ -47,6 +51,7 @@ pub fn locate(image: &RgbaImage, template: &LoadedTemplate) -> Match {
             let (ncc, mae) = score(
                 image,
                 &alpha,
+                &bias,
                 placed,
                 template.meta.color,
                 template.meta.blend_mode,
@@ -58,6 +63,7 @@ pub fn locate(image: &RgbaImage, template: &LoadedTemplate) -> Match {
                 shift: [dx, dy],
                 placement: Some(placed),
                 alpha: alpha.clone(),
+                bias: bias.clone(),
             };
             best = Some(match best {
                 None => candidate,
@@ -78,7 +84,22 @@ fn better(a: Match, b: Match) -> Match {
     a
 }
 
-fn score(image: &RgbaImage, alpha: &[f32], place: Placement, wm: [f32; 3], mode: BlendMode) -> (f32, f32) {
+fn raster_bias(template: &LoadedTemplate, w: u32, h: u32, fx: f32, fy: f32) -> Vec<f32> {
+    if template.bias.is_empty() {
+        Vec::new()
+    } else {
+        rasterize_plane(&template.bias, template.alpha_w, template.alpha_h, w, h, fx, fy)
+    }
+}
+
+fn score(
+    image: &RgbaImage,
+    alpha: &[f32],
+    bias: &[f32],
+    place: Placement,
+    wm: [f32; 3],
+    mode: BlendMode,
+) -> (f32, f32) {
     let x0 = place.origin_x.floor() as i32;
     let y0 = place.origin_y.floor() as i32;
     let w = place.width as i32;
@@ -98,11 +119,18 @@ fn score(image: &RgbaImage, alpha: &[f32], place: Placement, wm: [f32; 3], mode:
                 continue;
             }
             let p = image.get_pixel(x as u32, y as u32).0;
+            let i = (py * w + px) as usize;
+            let wm_px = if bias.len() == alpha.len() {
+                let unit = bias[i] / (a * 255.0);
+                [unit, unit, unit]
+            } else {
+                wm
+            };
             let mut acc = 0.0f32;
             let mut n = 0.0f32;
             for c in 0..3 {
-                let b = bg[c][(py * w + px) as usize];
-                if let Some(v) = implied_alpha(p[c] as f32 / 255.0, b, wm[c], mode) {
+                let b = bg[c][i];
+                if let Some(v) = implied_alpha(p[c] as f32 / 255.0, b, wm_px[c], mode) {
                     acc += v;
                     n += 1.0;
                 }
@@ -308,7 +336,8 @@ pub fn manual_match(template: &LoadedTemplate, image: &RgbaImage, bbox: [u32; 4]
         return Match::none();
     }
     let alpha = rasterize_alpha(template, w, h, 0.0, 0.0);
-    let (ncc, mae) = score(image, &alpha, place, template.meta.color, template.meta.blend_mode);
+    let bias = raster_bias(template, w, h, 0.0, 0.0);
+    let (ncc, mae) = score(image, &alpha, &bias, place, template.meta.color, template.meta.blend_mode);
     Match {
         applicable: true,
         ncc,
@@ -316,5 +345,6 @@ pub fn manual_match(template: &LoadedTemplate, image: &RgbaImage, bbox: [u32; 4]
         shift: [0, 0],
         placement: Some(place),
         alpha,
+        bias,
     }
 }

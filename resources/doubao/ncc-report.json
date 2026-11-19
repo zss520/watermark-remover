@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "sets": {
+    "positives": "docs/holdout/*-marked.png 与 docs/watermark/*.png，共 30 张",
+    "negatives": "docs/nowatermark/*.png 共 10 张，以及正样本定位框各平移 16 px 的 60 次评分"
+  },
+  "ncc": {
+    "positiveMin": 0.5198,
+    "positiveMinImage": "docs/holdout/01-marked.png",
+    "nowatermarkMax": 0.382,
+    "shift16Max": 0.4341,
+    "nccAuto": 0.48,
+    "nccConfirm": 0.48
+  },
+  "holdout": {
+    "passed": 10,
+    "total": 20,
+    "passRate": 0.5,
+    "promoted": false,
+    "quality": "visual",
+    "pairs": [
+      {"name": "01", "size": "1024x1024", "passed": false, "psnr": 51.94, "ssimMin": 0.9992, "maxAbs": 2, "outside": 0, "reason": "clamped"},
+      {"name": "02", "size": "1024x1024", "passed": true, "psnr": 51.95, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0},
+      {"name": "03", "size": "1024x1024", "passed": true, "psnr": 52.36, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0},
+      {"name": "04", "size": "1024x1024", "passed": false, "psnr": 52.0, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0, "reason": "clamped"},
+      {"name": "05", "size": "1536x1536", "passed": true, "psnr": 52.26, "ssimMin": 0.9993, "maxAbs": 2, "outside": 0},
+      {"name": "06", "size": "1536x1536", "passed": true, "psnr": 52.36, "ssimMin": 0.9995, "maxAbs": 2, "outside": 0},
+      {"name": "07", "size": "1536x1536", "passed": true, "psnr": 52.23, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0},
+      {"name": "08", "size": "1536x1536", "passed": false, "psnr": 51.97, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0, "reason": "clamped"},
+      {"name": "09", "size": "2048x2048", "passed": false, "psnr": 52.29, "ssimMin": 0.9989, "maxAbs": 2, "outside": 0, "reason": "ssim"},
+      {"name": "10", "size": "2048x2048", "passed": false, "psnr": 52.18, "ssimMin": 0.9991, "maxAbs": 2, "outside": 0, "reason": "ssim+clamped"},
+      {"name": "11", "size": "2048x2048", "passed": false, "psnr": 52.37, "ssimMin": 0.9982, "maxAbs": 2, "outside": 0, "reason": "ssim"},
+      {"name": "12", "size": "2048x2048", "passed": false, "psnr": 52.22, "ssimMin": 0.998, "maxAbs": 2, "outside": 0, "reason": "ssim+clamped"},
+      {"name": "13", "size": "512x512", "passed": true, "psnr": 51.89, "ssimMin": 0.9995, "maxAbs": 2, "outside": 0},
+      {"name": "14", "size": "512x512", "passed": true, "psnr": 51.74, "ssimMin": 0.9991, "maxAbs": 2, "outside": 0},
+      {"name": "15", "size": "512x512", "passed": false, "psnr": 51.42, "ssimMin": 0.9988, "maxAbs": 2, "outside": 0, "reason": "clamped"},
+      {"name": "16", "size": "512x512", "passed": false, "psnr": 51.55, "ssimMin": 0.9992, "maxAbs": 2, "outside": 0, "reason": "clamped"},
+      {"name": "17", "size": "2304x1728", "passed": true, "psnr": 52.39, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0},
+      {"name": "18", "size": "2304x1728", "passed": true, "psnr": 52.19, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0},
+      {"name": "19", "size": "2304x1728", "passed": true, "psnr": 52.48, "ssimMin": 0.9992, "maxAbs": 2, "outside": 0},
+      {"name": "20", "size": "2304x1728", "passed": false, "psnr": 52.09, "ssimMin": 0.9994, "maxAbs": 2, "outside": 0, "reason": "clamped"}
+    ]
+  }
+}

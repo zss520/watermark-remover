@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "id": "doubao",
+  "modelOk": true,
+  "sizes": [
+    {
+      "width": 1024,
+      "height": 1024,
+      "modelOk": true,
+      "colorSpace": "srgb",
+      "grayMae": 0.0,
+      "grayMax": 0,
+      "templateId": "doubao_1024x1024",
+      "affine": true
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "modelOk": true,
+      "colorSpace": "srgb",
+      "grayMae": 0.0,
+      "grayMax": 0,
+      "templateId": "doubao_512x512",
+      "affine": true
+    },
+    {
+      "width": 1536,
+      "height": 1536,
+      "modelOk": true,
+      "colorSpace": "srgb",
+      "grayMae": 0.0,
+      "grayMax": 0,
+      "templateId": "doubao_1536x1536",
+      "affine": true
+    },
+    {
+      "width": 2048,
+      "height": 2048,
+      "modelOk": true,
+      "colorSpace": "srgb",
+      "grayMae": 0.0,
+      "grayMax": 0,
+      "templateId": "doubao_2048x2048",
+      "affine": true
+    },
+    {
+      "width": 2304,
+      "height": 1728,
+      "modelOk": true,
+      "colorSpace": "srgb",
+      "grayMae": 0.0,
+      "grayMax": 0,
+      "templateId": "doubao_2304x1728",
+      "affine": true
+    }
+  ],
+  "candidates": [
+    {
+      "space": "affine-srgb",
+      "mae": 0.0,
+      "max": 0
+    },
+    {
+      "space": "affine-srgb",
+      "mae": 0.0,
+      "max": 0
+    },
+    {
+      "space": "affine-srgb",
+      "mae": 0.0,
+      "max": 0
+    },
+    {
+      "space": "affine-srgb",
+      "mae": 0.0,
+      "max": 0
+    },
+    {
+      "space": "affine-srgb",
+      "mae": 0.0,
+      "max": 0
+    }
+  ]
+}

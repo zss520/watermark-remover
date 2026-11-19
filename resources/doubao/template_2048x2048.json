@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "doubao_2048x2048",
+  "displayName": "豆包 2048×2048",
+  "version": 1,
+  "quality": "visual",
+  "blendMode": "source_over",
+  "colorSpace": "srgb",
+  "color": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "alphaMap": "alpha_2048x2048.png",
+  "alphaDepth": 16,
+  "alphaSha256": "714f1b5d86b3375ea54950621a665d2e4045fd29984a093c737a452f2c9a57b3",
+  "biasMap": "bias_2048x2048.png",
+  "biasSha256": "e3b78a08f0ec8760f8c41233bee119922f2b88619f54737cd6e84038be1aa9d7",
+  "placement": {
+    "anchor": "bottom-right",
+    "sizeBasis": "min-side",
+    "widthRatio": 0.16357422,
+    "aspect": 3.8068182,
+    "marginX": 0.018066406,
+    "marginY": 0.015625,
+    "subpixel": [
+      0.0,
+      0.0
+    ],
+    "minWidthPx": 48,
+    "paddingPx": 4
+  },
+  "alphaStableMax": 0.8,
+  "minImageSize": [
+    256,
+    256
+  ],
+  "nccAuto": 0.48,
+  "nccConfirm": 0.48,
+  "sourceSize": [
+    2048,
+    2048
+  ]
+}

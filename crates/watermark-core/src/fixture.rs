@@ -97,6 +97,8 @@ pub fn template_from_alpha(
         alpha_map: "alpha_maps/synthetic_v1.png".into(),
         alpha_depth: 16,
         alpha_sha256: String::new(),
+        bias_map: None,
+        bias_sha256: None,
         placement: PlacementSpec {
             anchor: "bottom-right".into(),
             size_basis: "min-side".into(),
@@ -112,10 +114,12 @@ pub fn template_from_alpha(
         min_image_size: [256, 256],
         ncc_auto: 0.85,
         ncc_confirm: 0.60,
+        source_size: None,
     };
     LoadedTemplate {
         meta,
         alpha,
+        bias: Vec::new(),
         alpha_w: aw,
         alpha_h: ah,
         source: None,

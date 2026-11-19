@@ -1,8 +1,9 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use watermark_core::{
-    decode_bytes, encode_alpha16, encode_png, load_template_embedded, process_best, sha256_hex, LoadedTemplate,
-    ProcessOptions,
+    decode_bytes, encode_alpha16, encode_png, load_template_embedded_parts, process_best, read_template_files,
+    sha256_hex, LoadedTemplate, ProcessOptions,
 };
 
 #[derive(Deserialize)]
@@ -10,6 +11,7 @@ use watermark_core::{
 struct TemplatePart {
     template_json: String,
     alpha_base64: String,
+    bias_base64: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -18,6 +20,7 @@ struct ProcessBody {
     image_base64: String,
     template_json: Option<String>,
     alpha_base64: Option<String>,
+    bias_base64: Option<String>,
     templates: Option<Vec<TemplatePart>>,
     accept: Option<bool>,
     jpeg: Option<bool>,
@@ -54,7 +57,16 @@ fn b64_decode(text: &str) -> Result<Vec<u8>, String> {
 
 fn demo_loaded() -> Result<LoadedTemplate, String> {
     let (json, png) = demo_template()?;
-    load_template_embedded(&json, &png).map_err(|err| err.to_string())
+    load_template_embedded_parts(&json, &png, None).map_err(|err| err.to_string())
+}
+
+fn load_part(json: &str, alpha_b64: &str, bias_b64: Option<&str>) -> Result<LoadedTemplate, String> {
+    let alpha = b64_decode(alpha_b64)?;
+    let bias = match bias_b64 {
+        Some(text) if !text.trim().is_empty() => Some(b64_decode(text)?),
+        _ => None,
+    };
+    load_template_embedded_parts(json, &alpha, bias.as_deref()).map_err(|err| err.to_string())
 }
 
 fn load_body_templates(body: &ProcessBody) -> Result<Vec<LoadedTemplate>, String> {
@@ -62,19 +74,51 @@ fn load_body_templates(body: &ProcessBody) -> Result<Vec<LoadedTemplate>, String
         if !list.is_empty() {
             let mut out = Vec::new();
             for part in list {
-                let alpha = b64_decode(&part.alpha_base64)?;
-                out.push(load_template_embedded(&part.template_json, &alpha).map_err(|err| err.to_string())?);
+                out.push(load_part(
+                    &part.template_json,
+                    &part.alpha_base64,
+                    part.bias_base64.as_deref(),
+                )?);
             }
             return Ok(out);
         }
     }
     match (&body.template_json, &body.alpha_base64) {
-        (Some(json), Some(alpha)) => {
-            let alpha = b64_decode(alpha)?;
-            Ok(vec![load_template_embedded(json, &alpha).map_err(|err| err.to_string())?])
-        }
+        (Some(json), Some(alpha)) => Ok(vec![load_part(json, alpha, body.bias_base64.as_deref())?]),
         _ => Ok(vec![demo_loaded()?]),
     }
+}
+
+fn bundled_template_dir() -> Option<PathBuf> {
+    ["resources/doubao", "../resources/doubao"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|dir| dir.join("template_1024x1024.json").is_file())
+}
+
+#[tauri::command]
+fn list_templates() -> Result<serde_json::Value, String> {
+    let Some(dir) = bundled_template_dir() else {
+        return Ok(serde_json::json!({
+            "templates": [],
+            "note": "没有找到豆包模板目录"
+        }));
+    };
+    let files = read_template_files(&dir).map_err(|err| err.to_string())?;
+    let templates: Vec<_> = files
+        .into_iter()
+        .map(|part| {
+            serde_json::json!({
+                "templateJson": part.json,
+                "alphaBase64": b64_encode(&part.alpha),
+                "biasBase64": part.bias.as_ref().map(|bytes| b64_encode(bytes)),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "templates": templates,
+        "note": "已载入豆包各尺寸模板。质量是视觉级，留出验证没有把它标成像素级。"
+    }))
 }
 
 fn demo_template() -> Result<(String, Vec<u8>), String> {
@@ -133,7 +177,7 @@ fn process_image(body: ProcessBody) -> Result<ApiResponse, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![sample_image, process_image])
+        .invoke_handler(tauri::generate_handler![sample_image, process_image, list_templates])
         .run(tauri::generate_context!())
         .expect("水印去除窗口启动失败");
 }

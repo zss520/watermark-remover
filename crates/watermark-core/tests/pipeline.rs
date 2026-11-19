@@ -2,7 +2,8 @@ use image::Rgba;
 use std::fs;
 use watermark_core::fixture::{self, template_from_alpha};
 use watermark_core::{
-    decode_bytes, load_template_embedded, load_template_file, process_one, verify_pairs, CalibrateRequest,
+    decode_bytes, load_template_embedded, load_template_file, process_best, process_one, verify_pairs,
+    CalibrateRequest,
     ColorSpace, Error, ProcessOptions, Quality, Verdict,
 };
 use watermark_core::calibrate_to_dir;
@@ -267,6 +268,7 @@ fn calibrate_distinguishes_srgb_and_linear() {
             display_name: "合成".into(),
             blacks: vec![black],
             grays: vec![gray],
+            lights: vec![],
         },
         &dir,
     )
@@ -283,6 +285,7 @@ fn calibrate_distinguishes_srgb_and_linear() {
             display_name: "线性".into(),
             blacks: vec![black],
             grays: vec![gray],
+            lights: vec![],
         },
         &dir2,
     )
@@ -308,6 +311,98 @@ fn confirmation_required_does_not_emit_pixels() {
     assert!(out.report.flags.iter().any(|f| f == "confirmation_required"));
     assert!(out.image.is_none());
     assert_eq!(out.report.verdict, Verdict::NeedsReview);
+}
+
+#[test]
+fn affine_bias_inverts_a_known_pixel() {
+    let dir = temp();
+    let mut black = image::RgbaImage::from_pixel(320, 320, Rgba([0, 0, 0, 255]));
+    let mut gray = image::RgbaImage::from_pixel(320, 320, Rgba([128, 128, 128, 255]));
+    let mut light = image::RgbaImage::from_pixel(320, 320, Rgba([192, 192, 192, 255]));
+    for y in 270..302 {
+        for x in 240..304 {
+            black.put_pixel(x, y, Rgba([20, 20, 20, 255]));
+            gray.put_pixel(x, y, Rgba([84, 84, 84, 255]));
+            light.put_pixel(x, y, Rgba([116, 116, 116, 255]));
+        }
+    }
+    let summary = calibrate_to_dir(
+        &CalibrateRequest {
+            id: "aff".into(),
+            display_name: "仿射".into(),
+            blacks: vec![black],
+            grays: vec![gray],
+            lights: vec![light],
+        },
+        &dir,
+    )
+    .unwrap();
+    assert!(summary.model_ok, "mae={} max={}", summary.gray_mae, summary.gray_max);
+    let json_path = dir.join("template.json");
+    let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value["nccConfirm"] = serde_json::json!(0.0);
+    value["nccAuto"] = serde_json::json!(0.0);
+    fs::write(&json_path, serde_json::to_string(&value).unwrap()).unwrap();
+    let template = load_template_file(&json_path).unwrap();
+    let mid = template
+        .alpha
+        .iter()
+        .position(|a| (*a - 0.5).abs() < 0.02)
+        .expect("alpha");
+    assert!((template.bias[mid] - 20.0).abs() < 0.05, "bias {}", template.bias[mid]);
+
+    let mut photo = image::RgbaImage::from_pixel(320, 320, Rgba([80, 90, 100, 255]));
+    for y in 270..302 {
+        for x in 240..304 {
+            let src = photo.get_pixel(x, y).0;
+            let mut out = [0, 0, 0, 255];
+            for c in 0..3 {
+                out[c] = (20.0 + 0.5 * src[c] as f32).round() as u8;
+            }
+            photo.put_pixel(x, y, Rgba(out));
+        }
+    }
+    let input = watermark_core::InputImage {
+        rgba: photo,
+        format: "png".into(),
+        precision_reduced: false,
+        non_srgb: false,
+        exif_tiff: None,
+    };
+    let out = process_one(&input, &template, &ProcessOptions {
+        accept_low_confidence: true,
+        ..ProcessOptions::default()
+    })
+    .unwrap();
+    let restored = out.image.expect(&format!("没有输出 {:?}", out.report.verdict));
+    assert_eq!(restored.get_pixel(250, 280).0, [80, 90, 100, 255], "{:?}", out.report);
+    assert_eq!(restored.get_pixel(0, 0).0, [80, 90, 100, 255]);
+    assert_eq!(out.report.counts.outside_diff_pixels, 0);
+    assert_eq!(out.report.counts.clamped_pixels, 0);
+}
+
+#[test]
+fn process_best_uses_the_template_measured_at_this_size() {
+    let demo = fixture::demo();
+    let mut right = demo.template.clone();
+    right.meta.id = "right".into();
+    right.meta.source_size = Some([demo.watermarked.width(), demo.watermarked.height()]);
+    let mut wrong = demo.template.clone();
+    wrong.meta.id = "wrong".into();
+    wrong.meta.source_size = Some([8, 8]);
+    let input = watermark_core::InputImage {
+        rgba: demo.watermarked.clone(),
+        format: "png".into(),
+        precision_reduced: false,
+        non_srgb: false,
+        exif_tiff: None,
+    };
+    let out = process_best(&input, &[wrong, right], &ProcessOptions {
+        accept_low_confidence: true,
+        ..ProcessOptions::default()
+    })
+    .unwrap();
+    assert_eq!(out.report.template_id.as_deref(), Some("right"));
 }
 
 #[test]
