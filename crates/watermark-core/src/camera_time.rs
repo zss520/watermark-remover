@@ -131,7 +131,14 @@ fn find_stamp(image: &RgbaImage) -> Option<Stamp> {
     // sit along the bottom, so this pass stays in that band.
     let h = image.height() as i32;
     let top = (h - (h / 5).max(80)).max(0);
-    find_at(image, 150, 28, top)
+    if let Some(stamp) = find_at(image, 150, 28, top) {
+        return Some(stamp);
+    }
+    // A stamp on white plastic is only a few levels brighter than the duct,
+    // and a dark seam beside a glyph makes the darkest nearby pixel look
+    // like the background. Compare with the local median in the bottom-right
+    // corner, which is where these camera stamps sit.
+    find_soft(image)
 }
 
 fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32, y_start: i32) -> Option<Stamp> {
@@ -153,14 +160,167 @@ fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32, y_start: i32) -> Opt
             }
         }
     }
-    let comps = components(&mask, w, h);
+    stamp_from_mask(&mask, w, h, false)
+}
+
+fn find_soft(image: &RgbaImage) -> Option<Stamp> {
+    let w = image.width() as i32;
+    let h = image.height() as i32;
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let y0 = (h - (h / 5).max(80)).max(0);
+    let x0 = w * 45 / 100;
+    let mut mask = vec![0u8; (w * h) as usize];
+    let radius = 18i32;
+    let step = 6i32;
+    let mut samples = [0i32; 49];
+    for y in y0..h {
+        for x in x0..w {
+            let lum = luma_at(image, x, y);
+            if lum < 150 {
+                continue;
+            }
+            let mut n = 0usize;
+            let mut dy = -radius;
+            while dy <= radius {
+                let yy = y + dy;
+                let mut dx = -radius;
+                while dx <= radius {
+                    let xx = x + dx;
+                    if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                        samples[n] = luma_at(image, xx, yy);
+                        n += 1;
+                    }
+                    dx += step;
+                }
+                dy += step;
+            }
+            if n < 20 {
+                continue;
+            }
+            samples[..n].sort_unstable();
+            if lum - samples[n / 2] >= 5 {
+                mask[(y * w + x) as usize] = 1;
+            }
+        }
+    }
+    // Single-pixel JPEG specks stick to a glyph and turn a 9 into a 7.
+    // A solid stroke still has several neighbors.
+    denoise_mask(&mut mask, w, h, x0, y0);
+    // A duct ridge is a hairline that joins a digit to a tall edge. The
+    // whole component is then taller than a glyph and gets discarded.
+    // Peel those hairlines off, and leave a thin "1" alone.
+    detach_ridges(&mut mask, w, h);
+    stamp_from_mask(&mask, w, h, true)
+}
+
+fn denoise_mask(mask: &mut [u8], w: i32, h: i32, x0: i32, y0: i32) {
+    let mut keep = vec![0u8; mask.len()];
+    for y in y0..h {
+        for x in x0..w {
+            let i = (y * w + x) as usize;
+            if mask[i] == 0 {
+                continue;
+            }
+            let mut n = 0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let xx = x + dx;
+                    let yy = y + dy;
+                    if xx >= 0 && yy >= 0 && xx < w && yy < h && mask[(yy * w + xx) as usize] != 0 {
+                        n += 1;
+                    }
+                }
+            }
+            if n >= 4 {
+                keep[i] = 1;
+            }
+        }
+    }
+    for y in y0..h {
+        for x in x0..w {
+            let i = (y * w + x) as usize;
+            mask[i] = keep[i];
+        }
+    }
+}
+
+fn detach_ridges(mask: &mut [u8], w: i32, h: i32) {
+    let mut hrun = vec![0i32; mask.len()];
+    for y in 0..h {
+        let mut x = 0;
+        while x < w {
+            if mask[(y * w + x) as usize] == 0 {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            x += 1;
+            while x < w && mask[(y * w + x) as usize] != 0 {
+                x += 1;
+            }
+            for xx in start..x {
+                hrun[(y * w + xx) as usize] = x - start;
+            }
+        }
+    }
+    let mut seen = vec![false; mask.len()];
+    let mut stack = Vec::new();
+    let mut pts = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let start = (y * w + x) as usize;
+            if mask[start] == 0 || seen[start] {
+                continue;
+            }
+            pts.clear();
+            stack.clear();
+            stack.push((x, y));
+            seen[start] = true;
+            let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+            while let Some((cx, cy)) = stack.pop() {
+                pts.push((cx, cy));
+                x0 = x0.min(cx);
+                y0 = y0.min(cy);
+                x1 = x1.max(cx);
+                y1 = y1.max(cy);
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let nx = cx + dx;
+                    let ny = cy + dy;
+                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                        continue;
+                    }
+                    let ni = (ny * w + nx) as usize;
+                    if mask[ni] == 0 || seen[ni] {
+                        continue;
+                    }
+                    seen[ni] = true;
+                    stack.push((nx, ny));
+                }
+            }
+            if y1 - y0 + 1 <= 64 {
+                continue;
+            }
+            for &(px, py) in &pts {
+                let i = (py * w + px) as usize;
+                if hrun[i] <= 2 {
+                    mask[i] = 0;
+                }
+            }
+        }
+    }
+}
+
+fn stamp_from_mask(mask: &[u8], w: i32, h: i32, trim: bool) -> Option<Stamp> {
+    let comps = components(mask, w, h);
     let mut lines = group_lines(&comps);
     lines.sort_by_key(|line| std::cmp::Reverse(line_bounds(&comps, line).3));
     for line in lines {
         // The model name and the date share a baseline. A wide gap keeps the
         // date from being swallowed by the longer model line.
         for part in split_wide_gaps(&comps, &line) {
-            if let Some(stamp) = read_line(&mask, w, &comps, &part) {
+            if let Some(stamp) = read_line(mask, w, &comps, &part, trim) {
                 return Some(stamp);
             }
         }
@@ -335,7 +495,7 @@ fn line_bounds(comps: &[Comp], line: &[usize]) -> (i32, i32, i32, i32) {
     (x0, y0, x1, y1)
 }
 
-fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stamp> {
+fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize], trim: bool) -> Option<Stamp> {
     // Dots and colon marks sit on the same line and are dropped after the
     // height filter, so the raw count is wider than the digit count.
     if !(8..=32).contains(&line.len()) {
@@ -360,6 +520,9 @@ fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stam
     if !(10..=16).contains(&kept.len()) {
         return None;
     }
+    // A one-pixel JPEG fringe on a soft mask turns a 9 into a 7. The stricter
+    // passes already match the glyph, and trimming them drops the score.
+    let kept: Vec<Comp> = if trim { kept.iter().map(|comp| trim_fringe(mask, w, *comp)).collect() } else { kept };
     let px = px_for_height(median_h as u32);
     let glyphs = glyph_bitmaps(px)?;
     let x0 = kept.iter().map(|comp| comp.x0).min().unwrap_or(0);
@@ -423,6 +586,8 @@ struct GapInk {
     gh: i32,
     gw: i32,
     mid: i32,
+    /// Ink in the top and bottom thirds with an empty middle: the two dots of a colon.
+    colon_like: bool,
 }
 
 fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapInk {
@@ -448,12 +613,17 @@ fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapIn
     }
     let mut runs = 0u32;
     let mut prev = false;
-    for on in rows {
-        if on && !prev {
+    for on in &rows {
+        if *on && !prev {
             runs += 1;
         }
-        prev = on;
+        prev = *on;
     }
+    let third = rows.len() / 3;
+    let colon_like = third > 0
+        && rows[..third].iter().any(|on| *on)
+        && rows[rows.len() - third..].iter().any(|on| *on)
+        && rows[third..rows.len() - third].iter().all(|on| !*on);
     GapInk {
         width: x1 - x0 + 1,
         ink,
@@ -461,6 +631,7 @@ fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapIn
         gh: if ink == 0 { 0 } else { iy1 - iy0 + 1 },
         gw: if ink == 0 { 0 } else { ix1 - ix0 + 1 },
         mid: if ink == 0 { 0 } else { (iy0 + iy1) / 2 },
+        colon_like,
     }
 }
 
@@ -473,7 +644,7 @@ fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32) -> Optio
     if gap.ink < 3 {
         return if wide { Some(' ') } else { Some('\0') };
     }
-    if gap.runs == 2 {
+    if gap.runs == 2 || (gap.colon_like && gap.gw * 2 <= line_h && gap.ink < 250) {
         return Some(':');
     }
     if gap.runs == 1 {
@@ -516,6 +687,28 @@ fn glyph_bitmaps(px: f32) -> Option<Vec<GlyphBmp>> {
         });
     }
     Some(out)
+}
+
+fn trim_fringe(mask: &[u8], w: i32, mut comp: Comp) -> Comp {
+    let row_ink = |y: i32, comp: Comp| -> i32 {
+        (comp.x0..=comp.x1).filter(|&x| mask[(y * w + x) as usize] != 0).count() as i32
+    };
+    let col_ink = |x: i32, comp: Comp| -> i32 {
+        (comp.y0..=comp.y1).filter(|&y| mask[(y * w + x) as usize] != 0).count() as i32
+    };
+    while comp.y0 < comp.y1 && row_ink(comp.y0, comp) < 3 {
+        comp.y0 += 1;
+    }
+    while comp.y1 > comp.y0 && row_ink(comp.y1, comp) < 3 {
+        comp.y1 -= 1;
+    }
+    while comp.x0 < comp.x1 && col_ink(comp.x0, comp) < 3 {
+        comp.x0 += 1;
+    }
+    while comp.x1 > comp.x0 && col_ink(comp.x1, comp) < 3 {
+        comp.x1 -= 1;
+    }
+    comp
 }
 
 fn classify(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> Option<char> {
@@ -1053,6 +1246,54 @@ mod tests {
             }
         }
         assert_eq!(stray, 0, "pixels changed outside the date on the right");
+    }
+
+    #[test]
+    fn cabinet_stamp_cut_by_a_seam_is_found() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912-cabinet.jpg");
+        let input = crate::image_io::decode_path(&path).expect("cabinet photo");
+        let found = detect_camera_time(&input.rgba).expect("date beside the seam");
+        assert_eq!(found.text, "2026.11.05 09:12");
+        assert_eq!(found.separator, '.');
+        assert_eq!(found.second, None);
+        let mut image = input.rgba.clone();
+        let change = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+        )
+        .unwrap();
+        assert_eq!(change.original, "2026.11.05 09:12");
+        assert_eq!(change.updated, "2026.12.01 09:30");
+        // The cabinet seam still crosses the first 0, so the redrawn glyphs
+        // are not always read back. A second read must not invent another time.
+        if let Some(again) = detect_camera_time(&image) {
+            assert_eq!(again.text, "2026.12.01 09:30");
+            assert_eq!(again.separator, '.');
+        }
+        let mut stray = 0u32;
+        for y in 0..image.height() {
+            for x in 0..2400 {
+                if image.get_pixel(x, y).0 != input.rgba.get_pixel(x, y).0 {
+                    stray += 1;
+                }
+            }
+        }
+        assert_eq!(stray, 0, "pixels changed on the model line");
+    }
+
+    #[test]
+    fn white_duct_stamp_is_not_guessed() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0919-duct.jpg");
+        let input = crate::image_io::decode_path(&path).expect("duct photo");
+        assert!(detect_camera_time(&input.rgba).is_none(), "faint stamp on the white duct");
+        let mut image = input.rgba.clone();
+        let err = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: None },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CameraTimeError::NotFound));
+        assert_eq!(image.as_raw(), input.rgba.as_raw());
     }
 
     #[test]
