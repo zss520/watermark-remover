@@ -1,4 +1,5 @@
-//! Optional rewrite of a camera date stamp such as `2026/11/15 16:08`.
+//! Optional rewrite of a camera date stamp such as `2026/11/15 16:08`
+//! or `2026.11.05 09:12`.
 //!
 //! The glyphs are redrawn with a bundled Inter SemiBold subset. It is the
 //! closest freely licensed match to the Huawei stamp measured on the sample
@@ -121,21 +122,26 @@ fn find_stamp(image: &RgbaImage) -> Option<Stamp> {
     let thresholds = [150, 185];
     let contrasts = [62, 48];
     for (&luma_min, &contrast) in thresholds.iter().zip(contrasts.iter()) {
-        if let Some(stamp) = find_at(image, luma_min, contrast) {
+        if let Some(stamp) = find_at(image, luma_min, contrast, 0) {
             return Some(stamp);
         }
     }
-    None
+    // White type on a light wall is only a little brighter than the plaster,
+    // and a thin stroke drops out at the stricter contrasts. Camera stamps
+    // sit along the bottom, so this pass stays in that band.
+    let h = image.height() as i32;
+    let top = (h - (h / 5).max(80)).max(0);
+    find_at(image, 150, 28, top)
 }
 
-fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32) -> Option<Stamp> {
+fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32, y_start: i32) -> Option<Stamp> {
     let w = image.width() as i32;
     let h = image.height() as i32;
     if w < 16 || h < 16 {
         return None;
     }
     let mut mask = vec![0u8; (w * h) as usize];
-    for y in 0..h {
+    for y in y_start..h {
         for x in 0..w {
             let lum = luma_at(image, x, y);
             if lum < luma_min {
@@ -151,8 +157,12 @@ fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32) -> Option<Stamp> {
     let mut lines = group_lines(&comps);
     lines.sort_by_key(|line| std::cmp::Reverse(line_bounds(&comps, line).3));
     for line in lines {
-        if let Some(stamp) = read_line(&mask, w, &comps, &line) {
-            return Some(stamp);
+        // The model name and the date share a baseline. A wide gap keeps the
+        // date from being swallowed by the longer model line.
+        for part in split_wide_gaps(&comps, &line) {
+            if let Some(stamp) = read_line(&mask, w, &comps, &part) {
+                return Some(stamp);
+            }
         }
     }
     None
@@ -258,6 +268,59 @@ fn group_lines(comps: &[Comp]) -> Vec<Vec<usize>> {
     lines
 }
 
+fn split_wide_gaps(comps: &[Comp], line: &[usize]) -> Vec<Vec<usize>> {
+    let mut idxs = line.to_vec();
+    idxs.sort_by_key(|&i| comps[i].x0);
+    if idxs.is_empty() {
+        return Vec::new();
+    }
+    let mut heights: Vec<i32> = idxs.iter().map(|&i| comps[i].y1 - comps[i].y0 + 1).collect();
+    heights.sort_unstable();
+    let upper = &heights[heights.len() / 2..];
+    let typical = upper[upper.len() / 2].max(1);
+    let mut groups = Vec::new();
+    let mut current = vec![idxs[0]];
+    for &idx in idxs.iter().skip(1) {
+        let prev = comps[*current.last().unwrap()];
+        let gap = comps[idx].x0 - prev.x1 - 1;
+        if gap > typical * 3 {
+            groups.push(std::mem::take(&mut current));
+        }
+        current.push(idx);
+    }
+    groups.push(current);
+    groups
+}
+
+fn merge_stacked(comps: Vec<Comp>) -> Vec<Comp> {
+    let mut out: Vec<Comp> = Vec::new();
+    for comp in comps {
+        if let Some(prev) = out.last_mut() {
+            let overlap = prev.x1.min(comp.x1) - prev.x0.max(comp.x0) + 1;
+            let narrow = (prev.x1 - prev.x0 + 1).min(comp.x1 - comp.x0 + 1);
+            let vgap = if comp.y0 > prev.y1 {
+                comp.y0 - prev.y1 - 1
+            } else if prev.y0 > comp.y1 {
+                prev.y0 - comp.y1 - 1
+            } else {
+                0
+            };
+            // A broken digit stacks two wide pieces. A separator dot is narrower
+            // than this and stays in the gap.
+            if overlap > 0 && overlap * 2 >= narrow && narrow >= 10 && vgap <= 4 {
+                prev.x0 = prev.x0.min(comp.x0);
+                prev.y0 = prev.y0.min(comp.y0);
+                prev.x1 = prev.x1.max(comp.x1);
+                prev.y1 = prev.y1.max(comp.y1);
+                prev.area = prev.area.saturating_add(comp.area);
+                continue;
+            }
+        }
+        out.push(comp);
+    }
+    out
+}
+
 fn line_bounds(comps: &[Comp], line: &[usize]) -> (i32, i32, i32, i32) {
     let mut x0 = i32::MAX;
     let mut y0 = i32::MAX;
@@ -273,21 +336,24 @@ fn line_bounds(comps: &[Comp], line: &[usize]) -> (i32, i32, i32, i32) {
 }
 
 fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stamp> {
-    if !(10..=16).contains(&line.len()) {
+    // Dots and colon marks sit on the same line and are dropped after the
+    // height filter, so the raw count is wider than the digit count.
+    if !(8..=32).contains(&line.len()) {
         return None;
     }
-    let mut idxs = line.to_vec();
-    idxs.sort_by_key(|&i| comps[i].x0);
-    let mut heights: Vec<i32> = idxs.iter().map(|&i| comps[i].y1 - comps[i].y0 + 1).collect();
+    let mut parts: Vec<Comp> = line.iter().map(|&i| comps[i]).collect();
+    parts.sort_by_key(|comp| (comp.x0, comp.y0));
+    let parts = merge_stacked(parts);
+    let mut heights: Vec<i32> = parts.iter().map(|comp| comp.y1 - comp.y0 + 1).collect();
     heights.sort_unstable();
     let median_h = heights[heights.len() / 2];
     if median_h < 6 {
         return None;
     }
-    let kept: Vec<usize> = idxs
+    let kept: Vec<Comp> = parts
         .into_iter()
-        .filter(|&i| {
-            let h = comps[i].y1 - comps[i].y0 + 1;
+        .filter(|comp| {
+            let h = comp.y1 - comp.y0 + 1;
             h * 10 >= median_h * 6 && h * 10 <= median_h * 14
         })
         .collect();
@@ -296,22 +362,45 @@ fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stam
     }
     let px = px_for_height(median_h as u32);
     let glyphs = glyph_bitmaps(px)?;
-    let (x0, y0, x1, y1) = line_bounds(comps, &kept);
+    let x0 = kept.iter().map(|comp| comp.x0).min().unwrap_or(0);
+    let y0 = kept.iter().map(|comp| comp.y0).min().unwrap_or(0);
+    let x1 = kept.iter().map(|comp| comp.x1).max().unwrap_or(0);
+    let y1 = kept.iter().map(|comp| comp.y1).max().unwrap_or(0);
+    let mut gaps = Vec::with_capacity(kept.len());
+    for n in 1..kept.len() {
+        let prev = kept[n - 1];
+        let cur = kept[n];
+        let gap = cur.x0 - prev.x1 - 1;
+        gaps.push(if gap > 1 {
+            Some(inspect_gap(mask, w, prev.x1 + 1, cur.x0 - 1, y0, y1))
+        } else {
+            None
+        });
+    }
+    let mut empty_widths: Vec<i32> = gaps.iter().filter_map(|gap| gap.as_ref()).filter(|gap| gap.ink < 3).map(|gap| gap.width).collect();
+    empty_widths.sort_unstable();
+    // Narrow digits such as "1" leave a gap that is almost as wide as a word
+    // space. When one empty gap is clearly wider than the others, only that
+    // one is the space.
+    let space_at = if empty_widths.len() >= 2 {
+        let largest = empty_widths[empty_widths.len() - 1];
+        let next = empty_widths[empty_widths.len() - 2];
+        if largest * 10 >= next * 14 { next + 1 } else { -1 }
+    } else {
+        -1
+    };
     let mut text = String::new();
-    for (n, &idx) in kept.iter().enumerate() {
+    for (n, comp) in kept.iter().enumerate() {
         if n > 0 {
-            let prev = comps[kept[n - 1]];
-            let cur = comps[idx];
-            let gap = cur.x0 - prev.x1 - 1;
-            if gap > 1 {
-                match gap_mark(mask, w, prev.x1 + 1, cur.x0 - 1, y0, y1, median_h) {
+            if let Some(gap) = &gaps[n - 1] {
+                match gap_char(gap, y0, y1, median_h, space_at) {
                     Some('\0') => {}
                     Some(ch) => text.push(ch),
                     None => return None,
                 }
             }
         }
-        let ch = classify(mask, w, comps[idx], &glyphs)?;
+        let ch = classify(mask, w, *comp, &glyphs)?;
         text.push(ch);
     }
     let parsed = parse_stamp(&text)?;
@@ -327,10 +416,16 @@ fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stam
     })
 }
 
-fn gap_mark(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32, line_h: i32) -> Option<char> {
-    if x1 < x0 {
-        return Some('\0');
-    }
+struct GapInk {
+    width: i32,
+    ink: u32,
+    runs: u32,
+    gh: i32,
+    gw: i32,
+    mid: i32,
+}
+
+fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapInk {
     let mut ink = 0u32;
     let mut ix0 = i32::MAX;
     let mut iy0 = i32::MAX;
@@ -351,11 +446,7 @@ fn gap_mark(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32, line_h: i32
         }
         rows.push(on);
     }
-    let wide = (x1 - x0 + 1) * 10 > line_h * 3;
-    if ink < 3 {
-        return if wide { Some(' ') } else { Some('\0') };
-    }
-    let mut runs = 0;
+    let mut runs = 0u32;
     let mut prev = false;
     for on in rows {
         if on && !prev {
@@ -363,25 +454,43 @@ fn gap_mark(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32, line_h: i32
         }
         prev = on;
     }
-    if runs == 2 {
+    GapInk {
+        width: x1 - x0 + 1,
+        ink,
+        runs,
+        gh: if ink == 0 { 0 } else { iy1 - iy0 + 1 },
+        gw: if ink == 0 { 0 } else { ix1 - ix0 + 1 },
+        mid: if ink == 0 { 0 } else { (iy0 + iy1) / 2 },
+    }
+}
+
+fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32) -> Option<char> {
+    let wide = if space_at >= 0 {
+        gap.width >= space_at
+    } else {
+        gap.width * 10 > line_h * 3
+    };
+    if gap.ink < 3 {
+        return if wide { Some(' ') } else { Some('\0') };
+    }
+    if gap.runs == 2 {
         return Some(':');
     }
-    if runs == 1 {
-        let gh = iy1 - iy0 + 1;
-        let gw = ix1 - ix0 + 1;
-        let mid = (iy0 + iy1) / 2;
+    if gap.runs == 1 {
         let line_mid = (y0 + y1) / 2;
-        if gh * 10 <= line_h * 5 && gw >= gh && (mid - line_mid).abs() * 2 <= line_h {
+        let centered = (gap.mid - line_mid).abs() * 5 <= line_h;
+        let low = gap.mid >= y0 + line_h * 3 / 5;
+        if gap.gh * 10 <= line_h * 5 && gap.gw >= gap.gh.saturating_mul(2) && centered {
             return Some('-');
         }
-        if gh * 10 <= line_h * 5 && gw * 10 <= gh * 16 && mid > line_mid {
+        if gap.gh * 10 <= line_h * 6 && gap.gw * 10 <= gap.gh * 18 && low {
             return Some('.');
         }
     }
-    if wide {
-        return None;
+    if gap.gh * 3 <= line_h && gap.gw * 3 <= line_h {
+        return Some('\0');
     }
-    Some('\0')
+    if wide { None } else { Some('\0') }
 }
 
 struct GlyphBmp {
@@ -914,6 +1023,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CameraTimeError::Invalid));
         assert_eq!(image.as_raw(), before.as_raw());
+    }
+
+    #[test]
+    fn light_wall_stamp_with_dots_is_found() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912.jpg");
+        let input = crate::image_io::decode_path(&path).expect("panel photo");
+        let found = detect_camera_time(&input.rgba).expect("date on the light wall");
+        assert_eq!(found.text, "2026.11.05 09:12");
+        assert_eq!(found.separator, '.');
+        assert_eq!(found.second, None);
+        let mut image = input.rgba.clone();
+        let change = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+        )
+        .unwrap();
+        assert_eq!(change.original, "2026.11.05 09:12");
+        assert_eq!(change.updated, "2026.12.01 09:30");
+        let again = detect_camera_time(&image).expect("rewritten dotted date");
+        assert_eq!(again.text, "2026.12.01 09:30");
+        assert_eq!(again.separator, '.');
+        let mut stray = 0u32;
+        for y in 0..image.height() {
+            for x in 0..2200 {
+                if image.get_pixel(x, y).0 != input.rgba.get_pixel(x, y).0 {
+                    stray += 1;
+                }
+            }
+        }
+        assert_eq!(stray, 0, "pixels changed outside the date on the right");
     }
 
     #[test]
