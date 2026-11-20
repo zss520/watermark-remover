@@ -34,6 +34,28 @@ export interface Report {
     maxAbs: number;
     stableMaxAbs: number;
   };
+  cameraTime?: { original: string; updated: string } | null;
+}
+
+export interface CameraTimeRequest {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number | null;
+}
+
+export interface DetectedCameraTime {
+  found: boolean;
+  text?: string;
+  year?: number;
+  month?: number;
+  day?: number;
+  hour?: number;
+  minute?: number;
+  second?: number | null;
+  separator?: string;
 }
 
 export interface Probe {
@@ -110,8 +132,13 @@ export function processImage(body: {
   noWatermark?: boolean;
   keepExif?: boolean;
   bbox?: [number, number, number, number];
+  cameraTime?: CameraTimeRequest;
 }): Promise<ProcessResponse> {
   return call("process_image", "/api/process", body);
+}
+
+export function detectCameraTime(imageBase64: string): Promise<DetectedCameraTime> {
+  return call("detect_camera_time", "/api/camera-time", { imageBase64 });
 }
 
 export function base64ToBlob(value: string, mime: string): Blob {

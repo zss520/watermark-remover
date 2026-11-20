@@ -1,4 +1,5 @@
 use crate::blend::{inverse_u8, BlendMode};
+use crate::camera_time::{self, CameraTimeError, CameraTimeValue};
 use crate::color::ColorSpace;
 use crate::image_io::{encode_jpeg, encode_png, patch_exif_orientation_to_top_left, png_insert_chunk, InputImage};
 use crate::locate::{locate, manual_match, Match};
@@ -16,6 +17,9 @@ pub struct ProcessOptions {
     pub lossy_jpeg: bool,
     pub keep_exif: bool,
     pub ambiguous: bool,
+    /// When set, rewrite a detected camera date after the watermark step.
+    /// `None` leaves every pixel the watermark step produced.
+    pub camera_time: Option<CameraTimeValue>,
 }
 
 impl Default for ProcessOptions {
@@ -27,6 +31,7 @@ impl Default for ProcessOptions {
             lossy_jpeg: false,
             keep_exif: false,
             ambiguous: false,
+            camera_time: None,
         }
     }
 }
@@ -63,15 +68,17 @@ pub fn process_one(
     template: &LoadedTemplate,
     opt: &ProcessOptions,
 ) -> Result<ProcessOutput, Error> {
-    if opt.no_watermark {
-        return Ok(copy_through(input, opt)?);
-    }
-    let found = if let Some(bbox) = opt.manual_bbox {
-        manual_match(template, &input.rgba, bbox)
+    let output = if opt.no_watermark {
+        copy_through(input, opt)?
     } else {
-        locate(&input.rgba, template)
+        let found = if let Some(bbox) = opt.manual_bbox {
+            manual_match(template, &input.rgba, bbox)
+        } else {
+            locate(&input.rgba, template)
+        };
+        restore_match(input, template, opt, found)?
     };
-    restore_match(input, template, opt, found)
+    apply_camera_time(input, opt, output)
 }
 
 pub fn process_best(
@@ -230,6 +237,7 @@ fn skeleton(
         flags,
         counts,
         holdout: None,
+        camera_time: None,
     }
 }
 
@@ -495,6 +503,58 @@ pub fn outside_diff(original: &RgbaImage, output: &RgbaImage, coverage: &Coverag
     diff
 }
 
+fn apply_camera_time(
+    input: &InputImage,
+    opt: &ProcessOptions,
+    mut output: ProcessOutput,
+) -> Result<ProcessOutput, Error> {
+    let Some(wanted) = opt.camera_time else {
+        return Ok(output);
+    };
+    if !camera_time::is_valid_camera_time(wanted) {
+        output.report.flags.push("camera_time_invalid".into());
+        return Ok(output);
+    }
+    let had_image = output.image.is_some();
+    let editable = had_image || matches!(output.report.verdict, Verdict::Unsupported);
+    if !editable {
+        output.report.flags.push("camera_time_skipped".into());
+        return Ok(output);
+    }
+    let mut image = output.image.take().unwrap_or_else(|| input.rgba.clone());
+    match camera_time::edit_camera_time(&mut image, wanted) {
+        Ok(change) => {
+            output.encoded = Some(encode_result(&image, input, opt)?);
+            output.report.output = Some(OutputInfo {
+                format: if opt.lossy_jpeg { "jpeg".into() } else { "png".into() },
+                lossy: opt.lossy_jpeg,
+            });
+            if matches!(
+                output.report.verdict,
+                Verdict::Pass | Verdict::PassWithUnstable | Verdict::NoWatermark | Verdict::Unsupported
+            ) {
+                output.report.verdict = Verdict::NeedsReview;
+            }
+            output.report.flags.push("camera_time_edited".into());
+            output.report.camera_time = Some(change);
+            output.image = Some(image);
+        }
+        Err(CameraTimeError::NotFound) => {
+            output.report.flags.push("camera_time_missing".into());
+            if had_image {
+                output.image = Some(image);
+            }
+        }
+        Err(CameraTimeError::Invalid) => {
+            output.report.flags.push("camera_time_invalid".into());
+            if had_image {
+                output.image = Some(image);
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn encode_result(image: &RgbaImage, input: &InputImage, opt: &ProcessOptions) -> Result<Vec<u8>, Error> {
     if opt.lossy_jpeg {
         return encode_jpeg(image, 95);
@@ -550,6 +610,7 @@ fn copy_through(input: &InputImage, opt: &ProcessOptions) -> Result<ProcessOutpu
         },
         counts: Counts::zero(),
         holdout: None,
+        camera_time: None,
     };
     Ok(ProcessOutput {
         image: Some(input.rgba.clone()),

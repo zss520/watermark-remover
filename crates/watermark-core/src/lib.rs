@@ -7,6 +7,7 @@
 
 mod blend;
 mod calibrate;
+mod camera_time;
 mod color;
 mod image_io;
 mod locate;
@@ -21,6 +22,8 @@ pub mod fixture;
 
 pub use blend::{forward_u8, forward_unit, inverse_pixel, inverse_u8, quantize_unit, BlendMode, InversePixel};
 pub use calibrate::{calibrate_to_dir, CalibrateRequest, CalibrateSummary};
+pub use camera_time::{detect_camera_time, is_valid_camera_time, CameraTimeValue, DetectedCameraTime};
+pub use report::CameraTimeChange;
 pub use color::ColorSpace;
 pub use image_io::{decode_bytes, decode_path, encode_jpeg, encode_png, InputImage};
 pub use locate::locate;

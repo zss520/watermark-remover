@@ -7,9 +7,11 @@ import {
   base64ToObjectUrl,
   bytesToBase64,
   fetchSample,
+  detectCameraTime,
   fetchTemplates,
   fileToBase64,
   processImage,
+  type CameraTimeRequest,
   type Probe,
   type Report,
   type TemplateBundle,
@@ -34,6 +36,15 @@ export function App() {
   const [jpeg, setJpeg] = useState(false);
   const [keepExif, setKeepExif] = useState(false);
   const [manual, setManual] = useState(false);
+  const [editTime, setEditTime] = useState(false);
+  const [year, setYear] = useState(2026);
+  const [month, setMonth] = useState(1);
+  const [day, setDay] = useState(1);
+  const [hour, setHour] = useState(0);
+  const [minute, setMinute] = useState(0);
+  const [second, setSecond] = useState(0);
+  const [hasSecond, setHasSecond] = useState(false);
+  const [timeNote, setTimeNote] = useState("勾选后会识别图中的相机时间，可改年月日时分秒。");
   const [zoom, setZoom] = useState(1);
   const [imageName, setImageName] = useState("image.png");
   const [imageBase64, setImageBase64] = useState("");
@@ -109,6 +120,38 @@ export function App() {
 
   useZoom(originalWrap, setZoom);
   useZoom(resultWrap, setZoom);
+
+  useEffect(() => {
+    if (!editTime || !imageBase64) return;
+    let cancelled = false;
+    detectCameraTime(imageBase64)
+      .then((found) => {
+        if (cancelled) return;
+        if (!found.found || found.year === undefined || found.month === undefined || found.day === undefined || found.hour === undefined || found.minute === undefined) {
+          setHasSecond(false);
+          setTimeNote("这张图没有识别到相机时间。处理时如果仍找不到，日期保持原样。");
+          return;
+        }
+        setYear(found.year);
+        setMonth(found.month);
+        setDay(found.day);
+        setHour(found.hour);
+        setMinute(found.minute);
+        setSecond(found.second ?? 0);
+        setHasSecond(found.second !== null && found.second !== undefined);
+        setTimeNote(
+          found.second === null || found.second === undefined
+            ? `识别到 ${found.text}。原格式没有秒，不会补上秒。机型那一行不改。`
+            : `识别到 ${found.text}。机型那一行不改。`,
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setTimeNote("读取相机时间失败。仍可填写，处理时如果找不到就不会改。");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editTime, imageBase64]);
 
   useEffect(() => {
     let cancelled = false;
@@ -256,6 +299,18 @@ export function App() {
     setError("");
   }
 
+  function cameraPayload(): CameraTimeRequest | undefined {
+    if (!editTime) return undefined;
+    return {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second: hasSecond ? second : null,
+    };
+  }
+
   async function runProcess(acceptLow: boolean) {
     if (!imageBase64) return;
     setBusy(true);
@@ -268,6 +323,7 @@ export function App() {
         jpeg,
         keepExif,
         bbox: bbox ?? undefined,
+        cameraTime: cameraPayload(),
       });
       setReport(response.report);
       setProbe(response.probe);
@@ -300,6 +356,7 @@ export function App() {
           jpeg,
           keepExif,
           bbox: bbox ?? undefined,
+          cameraTime: cameraPayload(),
         });
         const verdict = VERDICT_LABEL[response.report.verdict];
         items.push({ name: file.name, verdict });
@@ -488,6 +545,17 @@ export function App() {
           <input type="checkbox" checked={manual} onChange={(event) => setManual(event.target.checked)} />
           手动框选
         </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={editTime}
+            onChange={(event) => {
+              setEditTime(event.target.checked);
+              if (!event.target.checked) setTimeNote("勾选后会识别图中的相机时间，可改年月日时分秒。");
+            }}
+          />
+          修改相机时间
+        </label>
         <button type="button" onClick={() => setZoom(1)}>原始大小</button>
         <label className="file">
           批量
@@ -517,6 +585,17 @@ export function App() {
         </button>
         <button type="button" disabled={!bbox} onClick={exportMask}>只导出蒙版</button>
       </div>
+      {editTime ? (
+        <div className="time-row">
+          <TimeField label="年" value={year} min={1990} max={2099} className="year" onChange={setYear} />
+          <TimeField label="月" value={month} min={1} max={12} onChange={setMonth} />
+          <TimeField label="日" value={day} min={1} max={31} onChange={setDay} />
+          <TimeField label="时" value={hour} min={0} max={23} onChange={setHour} />
+          <TimeField label="分" value={minute} min={0} max={59} onChange={setMinute} />
+          <TimeField label="秒" value={second} min={0} max={59} disabled={!hasSecond} onChange={setSecond} />
+          <span className="note">{timeNote}</span>
+        </div>
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
       <main className="workspace">
         <section className="viewers">
@@ -628,6 +707,9 @@ function ReportView({ report }: { report: Report }) {
     ["夹紧像素", String(report.counts.clampedPixels)],
     ["框外差异", String(report.counts.outsideDiffPixels)],
   ];
+  if (report.cameraTime) {
+    rows.push(["相机时间", `${report.cameraTime.original} → ${report.cameraTime.updated}`]);
+  }
   return (
     <div>
       <span className={`verdict ${report.verdict}`}>{VERDICT_LABEL[report.verdict]}</span>
@@ -640,10 +722,50 @@ function ReportView({ report }: { report: Report }) {
         ))}
       </dl>
       {report.flags.includes("lossy_output") ? <p className="note">JPEG 有损，这张结果不能作为像素级还原。</p> : null}
+      {report.cameraTime ? <p className="note">相机时间已改写，字号和粗细按原水印匹配。机型那一行没有改。</p> : null}
+      {report.flags.includes("camera_time_missing") ? <p className="note">没有找到可改的相机时间，日期保持原样。</p> : null}
+      {report.flags.includes("camera_time_invalid") ? <p className="note">日期或时间不合法，没有改相机时间。</p> : null}
+      {report.flags.includes("camera_time_skipped") ? <p className="note">这张图还没写出结果，相机时间也没有改。</p> : null}
       {report.flags.length > 0 ? (
         <div className="flags">{report.flags.map((flag) => <span key={flag}>{flag}</span>)}</div>
       ) : null}
     </div>
+  );
+}
+
+function TimeField({
+  label,
+  value,
+  min,
+  max,
+  disabled,
+  className,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled?: boolean;
+  className?: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label>
+      {label}
+      <input
+        className={className}
+        type="number"
+        min={min}
+        max={max}
+        disabled={disabled}
+        value={value}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          if (Number.isFinite(next)) onChange(Math.trunc(next));
+        }}
+      />
+    </label>
   );
 }
 

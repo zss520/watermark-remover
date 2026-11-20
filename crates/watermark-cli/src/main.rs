@@ -80,6 +80,9 @@ struct ProcessArgs {
     no_watermark: bool,
     #[arg(long)]
     keep_exif: bool,
+    /// 改写相机时间，例如 2026-12-01T09:30。原图没有秒时不补秒。
+    #[arg(long)]
+    camera_time: Option<String>,
 }
 
 #[derive(Args)]
@@ -171,6 +174,7 @@ fn cmd_process(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&args.out)?;
     let inputs = collect_inputs(&args.input)?;
     let bbox = args.bbox.as_deref().map(parse_bbox).transpose()?;
+    let camera_time = args.camera_time.as_deref().map(parse_camera_time).transpose()?;
     let mut rows = Vec::new();
     let batch = inputs.len() > 1;
     for path in inputs {
@@ -185,6 +189,7 @@ fn cmd_process(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
                     lossy_jpeg: args.jpeg,
                     keep_exif: args.keep_exif,
                     ambiguous: false,
+                    camera_time,
                 };
                 match process_best(&input, &templates, &opt) {
                     Ok(output) => {
@@ -317,6 +322,34 @@ fn pair_dirs(samples: &Path, clean: &Path) -> Result<Vec<(String, InputImage, In
     Ok(pairs)
 }
 
+fn parse_camera_time(text: &str) -> Result<watermark_core::CameraTimeValue, Box<dyn std::error::Error>> {
+    let (date, time) = text
+        .split_once('T')
+        .ok_or("相机时间用 2026-12-01T09:30，需要秒时写成 2026-12-01T09:30:45")?;
+    let mut date_parts = date.split('-');
+    let year: u16 = date_parts.next().ok_or("缺少年")?.parse()?;
+    let month: u8 = date_parts.next().ok_or("缺少月")?.parse()?;
+    let day: u8 = date_parts.next().ok_or("缺少日")?.parse()?;
+    if date_parts.next().is_some() {
+        return Err("日期用 YYYY-MM-DD".into());
+    }
+    let mut time_parts = time.split(':');
+    let hour: u8 = time_parts.next().ok_or("缺少时")?.parse()?;
+    let minute: u8 = time_parts.next().ok_or("缺少分")?.parse()?;
+    let second = match time_parts.next() {
+        Some(part) if !part.is_empty() => Some(part.parse::<u8>()?),
+        _ => None,
+    };
+    if time_parts.next().is_some() {
+        return Err("时间用 HH:MM 或 HH:MM:SS".into());
+    }
+    let value = watermark_core::CameraTimeValue { year, month, day, hour, minute, second };
+    if !watermark_core::is_valid_camera_time(value) {
+        return Err("相机时间不是合法的年月日时分秒".into());
+    }
+    Ok(value)
+}
+
 fn parse_bbox(text: &str) -> Result<[u32; 4], Box<dyn std::error::Error>> {
     let parts: Vec<_> = text.split(',').collect();
     if parts.len() != 4 {
@@ -384,6 +417,8 @@ fn serve(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
             (200, templates_payload())
         } else if url.starts_with("/api/process") && method == tiny_http::Method::Post {
             (200, handle_process(&body))
+        } else if url.starts_with("/api/camera-time") && method == tiny_http::Method::Post {
+            (200, handle_camera_time(&body))
         } else {
             (404, "{\"error\":\"未知路径\"}".into())
         };
@@ -516,6 +551,42 @@ struct ProcessBody {
     no_watermark: Option<bool>,
     keep_exif: Option<bool>,
     bbox: Option<[u32; 4]>,
+    camera_time: Option<watermark_core::CameraTimeValue>,
+}
+
+fn handle_camera_time(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body {
+        image_base64: String,
+    }
+    let parsed: Body = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(err) => return serde_json::json!({"error": format!("请求不是合法 JSON：{err}")}).to_string(),
+    };
+    let bytes = match decode_b64(&parsed.image_base64) {
+        Ok(value) => value,
+        Err(err) => return serde_json::json!({"error": err}).to_string(),
+    };
+    let input = match decode_bytes(&bytes) {
+        Ok(value) => value,
+        Err(err) => return serde_json::json!({"error": err.to_string()}).to_string(),
+    };
+    match watermark_core::detect_camera_time(&input.rgba) {
+        Some(found) => serde_json::json!({
+            "found": true,
+            "text": found.text,
+            "year": found.year,
+            "month": found.month,
+            "day": found.day,
+            "hour": found.hour,
+            "minute": found.minute,
+            "second": found.second,
+            "separator": found.separator.to_string(),
+        })
+        .to_string(),
+        None => serde_json::json!({"found": false}).to_string(),
+    }
 }
 
 fn handle_process(body: &[u8]) -> String {
@@ -544,6 +615,7 @@ fn run_request(req: &ProcessBody) -> Result<String, String> {
         lossy_jpeg: req.jpeg.unwrap_or(false),
         keep_exif: req.keep_exif.unwrap_or(false),
         ambiguous: false,
+        camera_time: req.camera_time,
     };
     let output = process_best(&input, &templates, &opt).map_err(|e| e.to_string())?;
     let probe = output.probe.as_ref().map(|p| ApiProbe {

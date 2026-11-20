@@ -2,8 +2,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use watermark_core::{
-    decode_bytes, encode_alpha16, encode_png, load_template_embedded_parts, process_best, read_template_files,
-    sha256_hex, LoadedTemplate, ProcessOptions,
+    decode_bytes, detect_camera_time as find_camera_time, encode_alpha16, encode_png, load_template_embedded_parts, process_best,
+    read_template_files, sha256_hex, CameraTimeValue, LoadedTemplate, ProcessOptions,
 };
 
 #[derive(Deserialize)]
@@ -27,6 +27,7 @@ struct ProcessBody {
     no_watermark: Option<bool>,
     keep_exif: Option<bool>,
     bbox: Option<[u32; 4]>,
+    camera_time: Option<CameraTimeValue>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +145,32 @@ fn sample_image() -> Result<serde_json::Value, String> {
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetectBody {
+    image_base64: String,
+}
+
+#[tauri::command]
+fn detect_camera_time(body: DetectBody) -> Result<serde_json::Value, String> {
+    let bytes = b64_decode(&body.image_base64)?;
+    let input = decode_bytes(&bytes).map_err(|err| err.to_string())?;
+    Ok(match find_camera_time(&input.rgba) {
+        Some(found) => serde_json::json!({
+            "found": true,
+            "text": found.text,
+            "year": found.year,
+            "month": found.month,
+            "day": found.day,
+            "hour": found.hour,
+            "minute": found.minute,
+            "second": found.second,
+            "separator": found.separator.to_string(),
+        }),
+        None => serde_json::json!({ "found": false }),
+    })
+}
+
 #[tauri::command]
 fn process_image(body: ProcessBody) -> Result<ApiResponse, String> {
     let bytes = b64_decode(&body.image_base64)?;
@@ -159,6 +186,7 @@ fn process_image(body: ProcessBody) -> Result<ApiResponse, String> {
             lossy_jpeg: body.jpeg.unwrap_or(false),
             keep_exif: body.keep_exif.unwrap_or(false),
             ambiguous: false,
+            camera_time: body.camera_time,
         },
     )
     .map_err(|err| err.to_string())?;
@@ -177,7 +205,12 @@ fn process_image(body: ProcessBody) -> Result<ApiResponse, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![sample_image, process_image, list_templates])
+        .invoke_handler(tauri::generate_handler![
+            sample_image,
+            process_image,
+            list_templates,
+            detect_camera_time
+        ])
         .run(tauri::generate_context!())
         .expect("水印去除窗口启动失败");
 }

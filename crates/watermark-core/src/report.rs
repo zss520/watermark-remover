@@ -60,6 +60,13 @@ pub struct HoldoutMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CameraTimeChange {
+    pub original: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Report {
     pub schema_version: u32,
     pub input: InputInfo,
@@ -78,6 +85,8 @@ pub struct Report {
     pub flags: Vec<String>,
     pub counts: Counts,
     pub holdout: Option<HoldoutMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_time: Option<CameraTimeChange>,
 }
 
 #[derive(Debug, Clone)]
