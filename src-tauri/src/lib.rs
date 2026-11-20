@@ -1,6 +1,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tauri::Manager;
 use watermark_core::{
     decode_bytes, detect_camera_time as find_camera_time, encode_alpha16, encode_png, load_template_embedded_parts, process_best,
     read_template_files, sha256_hex, CameraTimeValue, LoadedTemplate, ProcessOptions,
@@ -90,16 +91,39 @@ fn load_body_templates(body: &ProcessBody) -> Result<Vec<LoadedTemplate>, String
     }
 }
 
+fn has_template(dir: &Path) -> bool {
+    dir.join("template_1024x1024.json").is_file()
+}
+
 fn bundled_template_dir() -> Option<PathBuf> {
-    ["resources/doubao", "../resources/doubao"]
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("resources/doubao"));
+            dirs.push(dir.join("doubao"));
+            if let Some(parent) = dir.parent() {
+                dirs.push(parent.join("resources/doubao"));
+            }
+        }
+    }
+    dirs.push(PathBuf::from("resources/doubao"));
+    dirs.push(PathBuf::from("../resources/doubao"));
+    dirs.into_iter().find(|dir| has_template(dir))
+}
+
+fn installed_template_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let root = app.path().resource_dir().ok()?;
+    ["doubao", "resources/doubao"]
         .into_iter()
-        .map(PathBuf::from)
-        .find(|dir| dir.join("template_1024x1024.json").is_file())
+        .map(|rel| root.join(rel))
+        .find(|dir| has_template(dir))
+        .or_else(bundled_template_dir)
 }
 
 #[tauri::command]
-fn list_templates() -> Result<serde_json::Value, String> {
-    let Some(dir) = bundled_template_dir() else {
+fn list_templates(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let Some(dir) = installed_template_dir(&app) else {
         return Ok(serde_json::json!({
             "templates": [],
             "note": "没有找到豆包模板目录"

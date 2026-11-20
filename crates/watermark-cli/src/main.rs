@@ -480,11 +480,25 @@ fn load_request_templates(req: &ProcessBody) -> Result<Vec<LoadedTemplate>, Stri
     }
 }
 
+fn has_template(dir: &Path) -> bool {
+    dir.join("template_1024x1024.json").is_file()
+}
+
 fn bundled_template_dir() -> Option<PathBuf> {
-    ["resources/doubao", "../resources/doubao"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|dir| dir.join("template_1024x1024.json").is_file())
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("resources/doubao"));
+            dirs.push(dir.join("doubao"));
+            if let Some(parent) = dir.parent() {
+                dirs.push(parent.join("resources/doubao"));
+            }
+        }
+    }
+    dirs.push(PathBuf::from("resources/doubao"));
+    dirs.push(PathBuf::from("../resources/doubao"));
+    dirs.into_iter().find(|dir| has_template(dir))
 }
 
 fn templates_payload() -> String {

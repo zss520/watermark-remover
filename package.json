@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "package": "bash scripts/package.sh",
     "preview": "vite preview --host 127.0.0.1 --port 1420"
   },
   "dependencies": {
