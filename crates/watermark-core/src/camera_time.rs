@@ -1412,7 +1412,7 @@ fn pixel(image: &RgbaImage, x: i32, y: i32) -> Option<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgba;
+    use image::{Rgba, RgbaImage};
 
     fn painted(text: &str) -> RgbaImage {
         let mut image = RgbaImage::new(720, 220);
@@ -1677,5 +1677,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn time_only_leaves_the_picture_except_the_date() {
+        let mut marked = painted("2026/11/15 16:08");
+        marked.put_pixel(8, 8, Rgba([1, 2, 3, 255]));
+        let input = crate::InputImage {
+            rgba: marked,
+            format: "png".into(),
+            precision_reduced: false,
+            non_srgb: false,
+            exif_tiff: None,
+        };
+        let out = crate::process_best(
+            &input,
+            &[],
+            &crate::ProcessOptions {
+                no_watermark: true,
+                camera_time: Some(CameraTimeValue {
+                    year: 2026,
+                    month: 12,
+                    day: 1,
+                    hour: 9,
+                    minute: 30,
+                    second: None,
+                }),
+                ..crate::ProcessOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.report.method, "copy");
+        assert_eq!(out.report.verdict, crate::Verdict::NeedsReview);
+        let change = out.report.camera_time.expect("edited");
+        assert_eq!(change.original, "2026/11/15 16:08");
+        assert_eq!(change.updated, "2026/12/01 09:30");
+        assert!(!out.report.flags.iter().any(|flag| {
+            flag == "camera_time_skipped" || flag == "watermark_not_written"
+        }));
+        let image = out.image.expect("time only");
+        assert_eq!(image.get_pixel(8, 8).0, [1, 2, 3, 255]);
+        let again = detect_camera_time(&image).expect("rewritten");
+        assert_eq!(again.text, "2026/12/01 09:30");
+    }
+
+    #[test]
+    fn time_only_without_a_stamp_does_not_write_a_file() {
+        let input = crate::InputImage {
+            rgba: RgbaImage::from_pixel(320, 180, Rgba([20, 20, 24, 255])),
+            format: "png".into(),
+            precision_reduced: false,
+            non_srgb: false,
+            exif_tiff: None,
+        };
+        let out = crate::process_best(
+            &input,
+            &[],
+            &crate::ProcessOptions {
+                no_watermark: true,
+                camera_time: Some(CameraTimeValue {
+                    year: 2026,
+                    month: 12,
+                    day: 1,
+                    hour: 9,
+                    minute: 30,
+                    second: None,
+                }),
+                ..crate::ProcessOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(out.image.is_none());
+        assert!(out.encoded.is_none());
+        assert!(out.report.output.is_none());
+        assert_eq!(out.report.verdict, crate::Verdict::NeedsReview);
+        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_missing"));
+        assert!(!out.report.flags.iter().any(|flag| flag == "camera_time_edited"));
+    }
+
+    #[test]
+    fn held_watermark_still_writes_the_time_on_the_original() {
+        let demo = crate::fixture::demo();
+        let mut rgba = demo.watermarked.clone();
+        draw_text(&mut rgba, "2026/11/15 16:08", 220, 80, 32.0, [255, 255, 255]);
+        let mut template = demo.template.clone();
+        template.meta.ncc_auto = 1.01;
+        template.meta.ncc_confirm = 0.0;
+        let input = crate::InputImage {
+            rgba: rgba.clone(),
+            format: "png".into(),
+            precision_reduced: false,
+            non_srgb: false,
+            exif_tiff: None,
+        };
+        let out = crate::process_one(
+            &input,
+            &template,
+            &crate::ProcessOptions {
+                camera_time: Some(CameraTimeValue {
+                    year: 2026,
+                    month: 12,
+                    day: 1,
+                    hour: 9,
+                    minute: 30,
+                    second: None,
+                }),
+                ..crate::ProcessOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(out.report.flags.iter().any(|flag| flag == "confirmation_required"));
+        assert!(out.report.flags.iter().any(|flag| flag == "watermark_not_written"));
+        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_edited"));
+        assert!(!out.report.flags.iter().any(|flag| flag == "camera_time_skipped"));
+        let image = out.image.expect("time file");
+        let change = out.report.camera_time.expect("edited");
+        assert_eq!(change.updated, "2026/12/01 09:30");
+        let [x, y, w, h] = out.report.bbox.expect("box");
+        let mut kept = false;
+        for py in y..y + h {
+            for px in x..x + w {
+                let before = rgba.get_pixel(px as u32, py as u32).0;
+                if before != demo.clean.get_pixel(px as u32, py as u32).0 {
+                    assert_eq!(
+                        image.get_pixel(px as u32, py as u32).0,
+                        before,
+                        "watermark pixel {px},{py}"
+                    );
+                    kept = true;
+                }
+            }
+        }
+        assert!(kept, "expected an untouched watermark pixel");
+    }
+
+    #[test]
+    fn missing_stamp_on_a_held_watermark_does_not_emit_a_copy() {
+        let demo = crate::fixture::demo();
+        let mut template = demo.template.clone();
+        template.meta.ncc_auto = 1.01;
+        template.meta.ncc_confirm = 0.0;
+        let input = crate::InputImage {
+            rgba: demo.watermarked,
+            format: "png".into(),
+            precision_reduced: false,
+            non_srgb: false,
+            exif_tiff: None,
+        };
+        let out = crate::process_one(
+            &input,
+            &template,
+            &crate::ProcessOptions {
+                camera_time: Some(CameraTimeValue {
+                    year: 2026,
+                    month: 12,
+                    day: 1,
+                    hour: 9,
+                    minute: 30,
+                    second: None,
+                }),
+                ..crate::ProcessOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(out.image.is_none());
+        assert!(out.encoded.is_none());
+        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_missing"));
+        assert!(out.report.flags.iter().any(|flag| flag == "confirmation_required"));
+        assert!(!out.report.flags.iter().any(|flag| flag == "watermark_not_written"));
     }
 }

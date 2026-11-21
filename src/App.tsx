@@ -36,6 +36,7 @@ export function App() {
   const [jpeg, setJpeg] = useState(false);
   const [keepExif, setKeepExif] = useState(false);
   const [manual, setManual] = useState(false);
+  const [removeWatermark, setRemoveWatermark] = useState(true);
   const [editTime, setEditTime] = useState(false);
   const [year, setYear] = useState(2026);
   const [month, setMonth] = useState(1);
@@ -311,25 +312,40 @@ export function App() {
     };
   }
 
+  function selectedWork(): boolean {
+    if (removeWatermark || editTime) return true;
+    setError("请至少选择去水印或修改相机时间。");
+    return false;
+  }
+
   async function runProcess(acceptLow: boolean) {
-    if (!imageBase64) return;
+    if (!imageBase64 || !selectedWork()) return;
     setBusy(true);
     setError("");
     try {
       const response = await processImage({
         imageBase64,
         templates: payloadTemplates(),
-        accept: acceptLow,
+        accept: removeWatermark && acceptLow,
         jpeg,
         keepExif,
-        bbox: bbox ?? undefined,
+        noWatermark: !removeWatermark,
+        bbox: removeWatermark ? bbox ?? undefined : undefined,
         cameraTime: cameraPayload(),
       });
       setReport(response.report);
       setProbe(response.probe);
       setResultBase64(response.imageBase64);
-      if (response.report.flags.includes("confirmation_required")) {
+      if (response.imageBase64 && response.report.flags.includes("watermark_not_written")) {
+        setNote(
+          response.report.flags.includes("confirmation_required")
+            ? "去水印还需要确认，这张结果只改了相机时间。确认低置信度后，会在去水印的图上再改一次。"
+            : "去水印没有写出，这张结果只改了相机时间。",
+        );
+      } else if (response.report.flags.includes("confirmation_required") && !response.imageBase64) {
         setNote("置信度处于确认区间，还没有写出结果。可以改框，或选择“确认低置信度”。");
+      } else if (!removeWatermark && editTime && response.imageBase64 && response.report.cameraTime) {
+        setNote("已只修改相机时间，没有去水印。");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "处理失败");
@@ -339,7 +355,7 @@ export function App() {
   }
 
   async function runBatch(files: FileList | null) {
-    if (!files || files.length === 0) return;
+    if (!files || files.length === 0 || !selectedWork()) return;
     setBusy(true);
     setError("");
     const items: BatchItem[] = [];
@@ -355,7 +371,8 @@ export function App() {
           accept: false,
           jpeg,
           keepExif,
-          bbox: bbox ?? undefined,
+          noWatermark: !removeWatermark,
+          bbox: removeWatermark ? bbox ?? undefined : undefined,
           cameraTime: cameraPayload(),
         });
         const verdict = VERDICT_LABEL[response.report.verdict];
@@ -417,7 +434,7 @@ export function App() {
   }
 
   function startBox(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!manual) return;
+    if (!manual || !removeWatermark) return;
     const canvas = originalRef.current;
     const point = canvas ? eventPoint(event, canvas) : null;
     if (!point) return;
@@ -481,7 +498,7 @@ export function App() {
       <header>
         <div>
           <h1>水印去除</h1>
-          <p>本地逆混合。图片留在这台机器上。</p>
+          <p>去水印和修改相机时间可以分开使用。图片留在这台机器上。</p>
         </div>
         <p className="note">{note}</p>
       </header>
@@ -530,7 +547,7 @@ export function App() {
         <button className="primary" type="button" disabled={busy || !imageBase64} onClick={() => ask(() => void runProcess(false))}>
           处理
         </button>
-        <button type="button" disabled={busy || !imageBase64} onClick={() => ask(() => void runProcess(true))}>
+        <button type="button" disabled={busy || !imageBase64 || !removeWatermark} onClick={() => ask(() => void runProcess(true))}>
           确认低置信度
         </button>
         <label className="check">
@@ -542,7 +559,16 @@ export function App() {
           保留方向已校正的 EXIF
         </label>
         <label className="check">
-          <input type="checkbox" checked={manual} onChange={(event) => setManual(event.target.checked)} />
+          <input type="checkbox" checked={removeWatermark} onChange={(event) => setRemoveWatermark(event.target.checked)} />
+          去水印
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={manual}
+            disabled={!removeWatermark}
+            onChange={(event) => setManual(event.target.checked)}
+          />
           手动框选
         </label>
         <label className="check">
@@ -722,7 +748,17 @@ function ReportView({ report }: { report: Report }) {
         ))}
       </dl>
       {report.flags.includes("lossy_output") ? <p className="note">JPEG 有损，这张结果不能作为像素级还原。</p> : null}
-      {report.cameraTime ? <p className="note">相机时间已改写，字号和粗细按原水印匹配。机型那一行没有改。</p> : null}
+      {report.cameraTime && report.method === "copy" ? (
+        <p className="note">没有去水印，只改了相机时间。机型那一行没有改。</p>
+      ) : report.cameraTime && report.flags.includes("watermark_not_written") ? (
+        <p className="note">
+          {report.flags.includes("confirmation_required")
+            ? "去水印还没写出，这张结果只改了相机时间。确认低置信度后，会在去水印的图上再改一次。"
+            : "去水印没有写出，这张结果只改了相机时间。机型那一行没有改。"}
+        </p>
+      ) : report.cameraTime ? (
+        <p className="note">相机时间已改写，字号和粗细按原水印匹配。机型那一行没有改。</p>
+      ) : null}
       {report.flags.includes("camera_time_missing") ? <p className="note">没有找到可改的相机时间，日期保持原样。</p> : null}
       {report.flags.includes("camera_time_invalid") ? <p className="note">日期或时间不合法，没有改相机时间。</p> : null}
       {report.flags.includes("camera_time_skipped") ? <p className="note">这张图还没写出结果，相机时间也没有改。</p> : null}

@@ -76,6 +76,7 @@ struct ProcessArgs {
     accept: bool,
     #[arg(long)]
     bbox: Option<String>,
+    /// 不去除水印。可以单独和 --camera-time 一起用，只改相机时间。
     #[arg(long)]
     no_watermark: bool,
     #[arg(long)]
@@ -170,7 +171,11 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_process(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let templates = load_requested(args.template.as_deref(), args.template_dir.as_deref())?;
+    let templates = if args.no_watermark && args.template.is_none() && args.template_dir.is_none() {
+        Vec::new()
+    } else {
+        load_requested(args.template.as_deref(), args.template_dir.as_deref())?
+    };
     fs::create_dir_all(&args.out)?;
     let inputs = collect_inputs(&args.input)?;
     let bbox = args.bbox.as_deref().map(parse_bbox).transpose()?;
