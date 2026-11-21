@@ -1,0 +1,19 @@
+水印去除 0.1.1（Windows）
+
+安装包文件名是「水印去除_0.1.1_x64-setup.exe」。双击安装后，从开始菜单打开「水印去除」。
+安装程序使用简体中文，默认装到当前用户目录，不需要管理员权限。
+如果系统里还没有 WebView2，安装程序会下载微软的 WebView2 运行库，这一步需要联网。
+
+也可以不安装，直接在这个目录里运行。不要把程序和 resources 拆开：
+
+  watermark-remover.exe
+  watermark-cli.exe serve --bind 127.0.0.1:8731
+
+豆包模板在 resources\doubao。去水印和修改相机时间可以分开使用。
+命令行只改相机时间、不去水印：
+
+  watermark-cli.exe process --input 图片.jpg --out 输出 --no-watermark --camera-time 2026-12-01T09:30
+
+两个一起做：
+
+  watermark-cli.exe process --input 图片.jpg --template-dir resources\doubao --out 输出 --camera-time 2026-12-01T09:30

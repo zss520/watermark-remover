@@ -1,0 +1,7 @@
+# 交叉编译 Windows 时静态链接通用 C 运行库。
+# cargo-xwin 会忽略 libucrt 的默认库项，所以这里再把 libucrt.lib 直接交给链接器。
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=libucrt.lib",
+]
