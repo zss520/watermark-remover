@@ -167,7 +167,12 @@ if (( cross )); then
   ${app_name}
   ${cli_name} serve --bind 127.0.0.1:8731
 
-豆包模板在 resources\\doubao。命令行改相机时间：
+豆包模板在 resources\\doubao。去水印和修改相机时间可以分开使用。
+命令行只改相机时间、不去水印：
+
+  ${cli_name} process --input 图片.jpg --out 输出 --no-watermark --camera-time 2026-12-01T09:30
+
+两个一起做：
 
   ${cli_name} process --input 图片.jpg --template-dir resources\\doubao --out 输出 --camera-time 2026-12-01T09:30
 EOF
@@ -180,7 +185,12 @@ else
   ./${app_name}
   ./${cli_name} serve --bind 127.0.0.1:8731
 
-豆包模板在 resources/doubao。命令行改相机时间：
+豆包模板在 resources/doubao。去水印和修改相机时间可以分开使用。
+命令行只改相机时间、不去水印：
+
+  ./${cli_name} process --input 图片.jpg --out 输出 --no-watermark --camera-time 2026-12-01T09:30
+
+两个一起做：
 
   ./${cli_name} process --input 图片.jpg --template-dir resources/doubao --out 输出 --camera-time 2026-12-01T09:30
 EOF
