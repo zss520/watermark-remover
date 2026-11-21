@@ -15,6 +15,11 @@
 # 安装包和便携 zip 会再复制到 release/windows/。
 #
 # 安装包不含 ONNX。压缩包和安装包都要小于 30 MB。
+#
+# 每次重新打包前把修订号加一。要一起改 package.json、package-lock.json、
+# src-tauri/tauri.conf.json、src-tauri/Cargo.toml、
+# crates/watermark-cli/Cargo.toml、crates/watermark-core/Cargo.toml，
+# 以及 Cargo.lock 和 src-tauri/Cargo.lock 里这两个包自己的版本。
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)

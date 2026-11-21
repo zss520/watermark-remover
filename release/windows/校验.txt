@@ -1,3 +1,3 @@
-48e1941dfe9e70b713e8121c621b4a15ac89a10d0ed89f9d924fcddd7b5eb741  watermark-remover-0.1.0-x86_64-pc-windows-msvc.zip
-79907b69ab12d6bf7d54dd74e0b8811ebe26f5c5d85d9c059fb13f2955808dda  使用说明.txt
-a6d048b6f20d96a0615a102a8638f0e8d4774ecdbdfaa34a38eb4b62bc7f24c9  水印去除_0.1.0_x64-setup.exe
+1fe5c9a67c875503b332618fafa690fe5a5c634d6aa6e7ccf5ae7fab657c5119  watermark-remover-0.1.1-x86_64-pc-windows-msvc.zip
+774077ef48d449f7729f7a80b2e7741af0bc35c4a3b80431a9a9ecc230aaae2e  使用说明.txt
+32b9853aaa2c270024eebe45251ae65e76f11a6ce7c1c8f26558552585994c59  水印去除_0.1.1_x64-setup.exe
