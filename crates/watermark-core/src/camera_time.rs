@@ -1160,20 +1160,30 @@ fn format_stamp(sep: char, has_second: bool, year: u16, month: u8, day: u8, hour
 }
 
 fn ink_color(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> [u8; 3] {
+    let mut glyphs = Vec::new();
     let mut samples = Vec::new();
     for y in y0..=y1 {
         for x in x0..=x1 {
-            if let Some(px) = pixel(image, x, y) {
-                samples.push((luma_of(px), [px[0], px[1], px[2]]));
+            let Some(px) = pixel(image, x, y) else {
+                continue;
+            };
+            let lum = luma_of(px);
+            samples.push((lum, [px[0], px[1], px[2]]));
+            if lum >= 150 && above_local(image, x, y, lum) >= 5 {
+                glyphs.push((lum, [px[0], px[1], px[2]]));
             }
         }
     }
-    if samples.is_empty() {
+    // The brightest quarter of the whole box is the plastic on a white duct.
+    // The stroke cores are the bright pixels that stand above their neighborhood.
+    let from_glyphs = glyphs.len() >= 8;
+    let pool = if from_glyphs { &mut glyphs } else { &mut samples };
+    if pool.is_empty() {
         return [255, 255, 255];
     }
-    samples.sort_by_key(|s| s.0);
-    let start = samples.len() * 3 / 4;
-    let slice = &samples[start..];
+    pool.sort_by_key(|s| s.0);
+    let start = if from_glyphs { pool.len() * 9 / 10 } else { pool.len() * 3 / 4 };
+    let slice = &pool[start..];
     let n = slice.len().max(1) as u32;
     let mut acc = [0u32; 3];
     for (_, rgb) in slice {
@@ -1181,7 +1191,42 @@ fn ink_color(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> [u8; 3] {
         acc[1] += rgb[1] as u32;
         acc[2] += rgb[2] as u32;
     }
-    [ (acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8 ]
+    [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8]
+}
+
+fn above_local(image: &RgbaImage, x: i32, y: i32, lum: i32) -> i32 {
+    let Some(median) = local_median_luma(image, x, y) else {
+        return 0;
+    };
+    lum - median
+}
+
+fn local_median_luma(image: &RgbaImage, x: i32, y: i32) -> Option<i32> {
+    let w = image.width() as i32;
+    let h = image.height() as i32;
+    let radius = 18i32;
+    let step = 6i32;
+    let mut samples = [0i32; 49];
+    let mut n = 0usize;
+    let mut dy = -radius;
+    while dy <= radius {
+        let yy = y + dy;
+        let mut dx = -radius;
+        while dx <= radius {
+            let xx = x + dx;
+            if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                samples[n] = luma_at(image, xx, yy);
+                n += 1;
+            }
+            dx += step;
+        }
+        dy += step;
+    }
+    if n < 20 {
+        return None;
+    }
+    samples[..n].sort_unstable();
+    Some(samples[n / 2])
 }
 
 fn background(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> ([u8; 3], i32) {
@@ -1228,10 +1273,12 @@ fn background(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> ([u8; 3]
 }
 
 fn erase_and_inpaint(image: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, bg: [u8; 3], cutoff: i32) {
-    let x0 = (x0 - 3).max(0);
-    let y0 = (y0 - 3).max(0);
-    let x1 = (x1 + 3).min(image.width() as i32 - 1);
-    let y1 = (y1 + 3).min(image.height() as i32 - 1);
+    let bg_luma = luma_of([bg[0], bg[1], bg[2], 255]);
+    let pad = if bg_luma >= 170 { 10 } else { 3 };
+    let x0 = (x0 - pad).max(0);
+    let y0 = (y0 - pad).max(0);
+    let x1 = (x1 + pad).min(image.width() as i32 - 1);
+    let y1 = (y1 + pad).min(image.height() as i32 - 1);
     if x1 < x0 || y1 < y0 {
         return;
     }
@@ -1244,25 +1291,65 @@ fn erase_and_inpaint(image: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, 
             let px = image.get_pixel((x0 as usize + x) as u32, (y0 as usize + y) as u32).0;
             let i = y * bw + x;
             rgb[i] = [px[0], px[1], px[2]];
-            if luma_of(px) > cutoff {
+            let lum = luma_of(px);
+            let xx = x0 + x as i32;
+            let yy = y0 + y as i32;
+            // A global cutoff catches white type on a dark photo. On a white
+            // duct the stroke is only a few levels above the plastic, so the
+            // same test the reader uses has to mark those cores as well.
+            if lum > cutoff || (lum >= 150 && above_local(image, xx, yy, lum) >= 2) {
                 hole[i] = true;
             }
         }
     }
-    // The gray fringe of a white glyph sits only a little above the photo,
-    // so a luma cutoff leaves a ghost. Spread the bright core by two pixels.
-    let core = hole.clone();
-    for y in 0..bh {
-        for x in 0..bw {
-            if !core[y * bw + x] {
-                continue;
+    // A faint stroke on white plastic blooms wider than two pixels. On a light
+    // surface, follow that glow until it falls back to the plastic, and stop
+    // at a dark groove. On a darker photo, only the fringe next to the core
+    // is removed so the picture behind the date stays.
+    if bg_luma >= 170 {
+        let mut stack = Vec::new();
+        for i in 0..hole.len() {
+            if hole[i] {
+                stack.push(i);
             }
-            for dy in -2i32..=2 {
-                for dx in -2i32..=2 {
-                    let xx = x as i32 + dx;
-                    let yy = y as i32 + dy;
-                    if xx >= 0 && yy >= 0 && xx < bw as i32 && yy < bh as i32 {
-                        hole[yy as usize * bw + xx as usize] = true;
+        }
+        while let Some(i) = stack.pop() {
+            let x = (i % bw) as i32;
+            let y = (i / bw) as i32;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let xx = x + dx;
+                let yy = y + dy;
+                if xx < 0 || yy < 0 || xx >= bw as i32 || yy >= bh as i32 {
+                    continue;
+                }
+                let j = yy as usize * bw + xx as usize;
+                if hole[j] {
+                    continue;
+                }
+                let lum = luma_of([rgb[j][0], rgb[j][1], rgb[j][2], 255]);
+                // The stroke also leaves a shadow a little darker than the
+                // plastic. A bright-only fill keeps that outline of the old
+                // time. Deep grooves are much darker and stay.
+                if lum + 30 >= bg_luma {
+                    hole[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    } else {
+        let core = hole.clone();
+        for y in 0..bh {
+            for x in 0..bw {
+                if !core[y * bw + x] {
+                    continue;
+                }
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let xx = x as i32 + dx;
+                        let yy = y as i32 + dy;
+                        if xx >= 0 && yy >= 0 && xx < bw as i32 && yy < bh as i32 {
+                            hole[yy as usize * bw + xx as usize] = true;
+                        }
                     }
                 }
             }
@@ -1589,6 +1676,25 @@ mod tests {
         .unwrap();
         assert_eq!(change.original, "2026.11.05 09:19");
         assert_eq!(change.updated, "2026.12.01 09:30");
+        let stamp = find_stamp(&input.rgba).expect("stamp box");
+        let (bg, _) = background(&input.rgba, stamp.x0, stamp.y0, stamp.x1, stamp.y1);
+        let bg_l = luma_of([bg[0], bg[1], bg[2], 255]);
+        let mut stroke = 0u32;
+        let mut leftover = 0u32;
+        for y in stamp.y0..=stamp.y1 {
+            for x in stamp.x0..=stamp.x1 {
+                let before = input.rgba.get_pixel(x as u32, y as u32).0;
+                if luma_of(before) + 25 < bg_l {
+                    continue;
+                }
+                stroke += 1;
+                if image.get_pixel(x as u32, y as u32).0 == before {
+                    leftover += 1;
+                }
+            }
+        }
+        assert!(stroke > 1000, "stroke pixels {stroke}");
+        assert!(leftover * 5 < stroke, "old time still in place {leftover}/{stroke}");
         if let Some(again) = detect_camera_time(&image) {
             assert_eq!(again.text, "2026.12.01 09:30");
             assert_eq!(again.separator, '.');
