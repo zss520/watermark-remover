@@ -86,6 +86,10 @@ pub fn process_best(
     templates: &[LoadedTemplate],
     opt: &ProcessOptions,
 ) -> Result<ProcessOutput, Error> {
+    if opt.no_watermark {
+        let output = copy_through(input, opt)?;
+        return apply_camera_time(input, opt, output);
+    }
     if templates.is_empty() {
         return Err(Error::Template("没有可用模板".into()));
     }
@@ -101,7 +105,7 @@ pub fn process_best(
     } else {
         matched
     };
-    if pool.len() == 1 || opt.manual_bbox.is_some() || opt.no_watermark {
+    if pool.len() == 1 || opt.manual_bbox.is_some() {
         return process_one(input, &templates[pool[0]], opt);
     }
     let mut scored: Vec<(f32, usize)> = pool
@@ -515,12 +519,11 @@ fn apply_camera_time(
         output.report.flags.push("camera_time_invalid".into());
         return Ok(output);
     }
-    let had_image = output.image.is_some();
-    let editable = had_image || matches!(output.report.verdict, Verdict::Unsupported);
-    if !editable {
-        output.report.flags.push("camera_time_skipped".into());
-        return Ok(output);
-    }
+    // Time editing does not wait for a watermark image. A held or failed
+    // removal still rewrites the date on the original and returns that picture.
+    // The date function returns before it paints when the stamp is missing,
+    // so the taken image can be put back unchanged.
+    let from_original = output.image.is_none();
     let mut image = output.image.take().unwrap_or_else(|| input.rgba.clone());
     match camera_time::edit_camera_time(&mut image, wanted) {
         Ok(change) => {
@@ -536,23 +539,37 @@ fn apply_camera_time(
                 output.report.verdict = Verdict::NeedsReview;
             }
             output.report.flags.push("camera_time_edited".into());
+            if from_original && !opt.no_watermark {
+                output.report.flags.push("watermark_not_written".into());
+            }
             output.report.camera_time = Some(change);
             output.image = Some(image);
         }
         Err(CameraTimeError::NotFound) => {
             output.report.flags.push("camera_time_missing".into());
-            if had_image {
-                output.image = Some(image);
-            }
+            keep_prior_image(&mut output, image, from_original, opt.no_watermark);
         }
         Err(CameraTimeError::Invalid) => {
             output.report.flags.push("camera_time_invalid".into());
-            if had_image {
-                output.image = Some(image);
-            }
+            keep_prior_image(&mut output, image, from_original, opt.no_watermark);
         }
     }
     Ok(output)
+}
+
+fn keep_prior_image(output: &mut ProcessOutput, image: RgbaImage, from_original: bool, no_watermark: bool) {
+    // A removed watermark is still a result when the date cannot be rewritten.
+    // A plain copy is not: the user asked for a time change and did not get one.
+    if !from_original && !no_watermark {
+        output.image = Some(image);
+        return;
+    }
+    output.image = None;
+    output.encoded = None;
+    output.report.output = None;
+    if no_watermark {
+        output.report.verdict = Verdict::NeedsReview;
+    }
 }
 
 fn encode_result(image: &RgbaImage, input: &InputImage, opt: &ProcessOptions) -> Result<Vec<u8>, Error> {
