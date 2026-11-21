@@ -1,4 +1,5 @@
-//! Optional rewrite of a camera date stamp such as `2026/11/15 16:08`.
+//! Optional rewrite of a camera date stamp such as `2026/11/15 16:08`
+//! or `2026.11.05 09:12`.
 //!
 //! The glyphs are redrawn with a bundled Inter SemiBold subset. It is the
 //! closest freely licensed match to the Huawei stamp measured on the sample
@@ -121,21 +122,33 @@ fn find_stamp(image: &RgbaImage) -> Option<Stamp> {
     let thresholds = [150, 185];
     let contrasts = [62, 48];
     for (&luma_min, &contrast) in thresholds.iter().zip(contrasts.iter()) {
-        if let Some(stamp) = find_at(image, luma_min, contrast) {
+        if let Some(stamp) = find_at(image, luma_min, contrast, 0) {
             return Some(stamp);
         }
     }
-    None
+    // White type on a light wall is only a little brighter than the plaster,
+    // and a thin stroke drops out at the stricter contrasts. Camera stamps
+    // sit along the bottom, so this pass stays in that band.
+    let h = image.height() as i32;
+    let top = (h - (h / 5).max(80)).max(0);
+    if let Some(stamp) = find_at(image, 150, 28, top) {
+        return Some(stamp);
+    }
+    // A stamp on white plastic is only a few levels brighter than the duct,
+    // and a dark seam beside a glyph makes the darkest nearby pixel look
+    // like the background. Compare with the local median in the bottom-right
+    // corner, which is where these camera stamps sit.
+    find_soft(image)
 }
 
-fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32) -> Option<Stamp> {
+fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32, y_start: i32) -> Option<Stamp> {
     let w = image.width() as i32;
     let h = image.height() as i32;
     if w < 16 || h < 16 {
         return None;
     }
     let mut mask = vec![0u8; (w * h) as usize];
-    for y in 0..h {
+    for y in y_start..h {
         for x in 0..w {
             let lum = luma_at(image, x, y);
             if lum < luma_min {
@@ -147,12 +160,172 @@ fn find_at(image: &RgbaImage, luma_min: i32, contrast: i32) -> Option<Stamp> {
             }
         }
     }
-    let comps = components(&mask, w, h);
+    stamp_from_mask(&mask, w, h, false)
+}
+
+fn find_soft(image: &RgbaImage) -> Option<Stamp> {
+    let w = image.width() as i32;
+    let h = image.height() as i32;
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let y0 = (h - (h / 5).max(80)).max(0);
+    let x0 = w * 45 / 100;
+    let mut mask = vec![0u8; (w * h) as usize];
+    let radius = 18i32;
+    let step = 6i32;
+    let mut samples = [0i32; 49];
+    for y in y0..h {
+        for x in x0..w {
+            let lum = luma_at(image, x, y);
+            if lum < 150 {
+                continue;
+            }
+            let mut n = 0usize;
+            let mut dy = -radius;
+            while dy <= radius {
+                let yy = y + dy;
+                let mut dx = -radius;
+                while dx <= radius {
+                    let xx = x + dx;
+                    if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                        samples[n] = luma_at(image, xx, yy);
+                        n += 1;
+                    }
+                    dx += step;
+                }
+                dy += step;
+            }
+            if n < 20 {
+                continue;
+            }
+            samples[..n].sort_unstable();
+            if lum - samples[n / 2] >= 5 {
+                mask[(y * w + x) as usize] = 1;
+            }
+        }
+    }
+    // Single-pixel JPEG specks stick to a glyph and turn a 9 into a 7.
+    // A solid stroke still has several neighbors.
+    denoise_mask(&mut mask, w, h, x0, y0);
+    // A duct ridge is a hairline that joins a digit to a tall edge. The
+    // whole component is then taller than a glyph and gets discarded.
+    // Peel those hairlines off, and leave a thin "1" alone.
+    detach_ridges(&mut mask, w, h);
+    stamp_from_mask(&mask, w, h, true)
+}
+
+fn denoise_mask(mask: &mut [u8], w: i32, h: i32, x0: i32, y0: i32) {
+    let mut keep = vec![0u8; mask.len()];
+    for y in y0..h {
+        for x in x0..w {
+            let i = (y * w + x) as usize;
+            if mask[i] == 0 {
+                continue;
+            }
+            let mut n = 0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let xx = x + dx;
+                    let yy = y + dy;
+                    if xx >= 0 && yy >= 0 && xx < w && yy < h && mask[(yy * w + xx) as usize] != 0 {
+                        n += 1;
+                    }
+                }
+            }
+            let up = y > 0 && mask[((y - 1) * w + x) as usize] != 0;
+            let down = y + 1 < h && mask[((y + 1) * w + x) as usize] != 0;
+            // A one-pixel stem still has a neighbor above and below. An isolated speck does not.
+            if n >= 4 || (n >= 3 && up && down) {
+                keep[i] = 1;
+            }
+        }
+    }
+    for y in y0..h {
+        for x in x0..w {
+            let i = (y * w + x) as usize;
+            mask[i] = keep[i];
+        }
+    }
+}
+
+fn detach_ridges(mask: &mut [u8], w: i32, h: i32) {
+    let mut hrun = vec![0i32; mask.len()];
+    for y in 0..h {
+        let mut x = 0;
+        while x < w {
+            if mask[(y * w + x) as usize] == 0 {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            x += 1;
+            while x < w && mask[(y * w + x) as usize] != 0 {
+                x += 1;
+            }
+            for xx in start..x {
+                hrun[(y * w + xx) as usize] = x - start;
+            }
+        }
+    }
+    let mut seen = vec![false; mask.len()];
+    let mut stack = Vec::new();
+    let mut pts = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let start = (y * w + x) as usize;
+            if mask[start] == 0 || seen[start] {
+                continue;
+            }
+            pts.clear();
+            stack.clear();
+            stack.push((x, y));
+            seen[start] = true;
+            let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+            while let Some((cx, cy)) = stack.pop() {
+                pts.push((cx, cy));
+                x0 = x0.min(cx);
+                y0 = y0.min(cy);
+                x1 = x1.max(cx);
+                y1 = y1.max(cy);
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let nx = cx + dx;
+                    let ny = cy + dy;
+                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                        continue;
+                    }
+                    let ni = (ny * w + nx) as usize;
+                    if mask[ni] == 0 || seen[ni] {
+                        continue;
+                    }
+                    seen[ni] = true;
+                    stack.push((nx, ny));
+                }
+            }
+            if y1 - y0 + 1 <= 64 {
+                continue;
+            }
+            for &(px, py) in &pts {
+                let i = (py * w + px) as usize;
+                if hrun[i] <= 2 {
+                    mask[i] = 0;
+                }
+            }
+        }
+    }
+}
+
+fn stamp_from_mask(mask: &[u8], w: i32, h: i32, trim: bool) -> Option<Stamp> {
+    let comps = components(mask, w, h);
     let mut lines = group_lines(&comps);
     lines.sort_by_key(|line| std::cmp::Reverse(line_bounds(&comps, line).3));
     for line in lines {
-        if let Some(stamp) = read_line(&mask, w, &comps, &line) {
-            return Some(stamp);
+        // The model name and the date share a baseline. A wide gap keeps the
+        // date from being swallowed by the longer model line.
+        for part in split_wide_gaps(&comps, &line) {
+            if let Some(stamp) = read_line(mask, w, &comps, &part, trim) {
+                return Some(stamp);
+            }
         }
     }
     None
@@ -258,6 +431,62 @@ fn group_lines(comps: &[Comp]) -> Vec<Vec<usize>> {
     lines
 }
 
+fn split_wide_gaps(comps: &[Comp], line: &[usize]) -> Vec<Vec<usize>> {
+    let mut idxs = line.to_vec();
+    idxs.sort_by_key(|&i| comps[i].x0);
+    if idxs.is_empty() {
+        return Vec::new();
+    }
+    let mut heights: Vec<i32> = idxs.iter().map(|&i| comps[i].y1 - comps[i].y0 + 1).collect();
+    heights.sort_unstable();
+    let upper = &heights[heights.len() / 2..];
+    let typical = upper[upper.len() / 2].max(1);
+    let mut groups = Vec::new();
+    let mut current = vec![idxs[0]];
+    for &idx in idxs.iter().skip(1) {
+        let prev = comps[*current.last().unwrap()];
+        let gap = comps[idx].x0 - prev.x1 - 1;
+        if gap > typical * 3 {
+            groups.push(std::mem::take(&mut current));
+        }
+        current.push(idx);
+    }
+    groups.push(current);
+    groups
+}
+
+fn merge_stacked(comps: Vec<Comp>, min_narrow: i32) -> Vec<Comp> {
+    let mut out: Vec<Comp> = Vec::new();
+    for comp in comps {
+        if let Some(prev) = out.last_mut() {
+            let overlap = prev.x1.min(comp.x1) - prev.x0.max(comp.x0) + 1;
+            let narrow = (prev.x1 - prev.x0 + 1).min(comp.x1 - comp.x0 + 1);
+            let vgap = if comp.y0 > prev.y1 {
+                comp.y0 - prev.y1 - 1
+            } else if prev.y0 > comp.y1 {
+                prev.y0 - comp.y1 - 1
+            } else {
+                0
+            };
+            // A broken digit stacks two pieces. On the soft pass a narrow
+            // fragment may join too, but a short separator dot must not.
+            let shorter = (prev.y1 - prev.y0 + 1).min(comp.y1 - comp.y0 + 1);
+            let taller = (prev.y1 - prev.y0 + 1).max(comp.y1 - comp.y0 + 1);
+            let alike = min_narrow >= 10 || shorter * 3 >= taller;
+            if overlap > 0 && overlap * 2 >= narrow && narrow >= min_narrow && vgap <= 4 && alike {
+                prev.x0 = prev.x0.min(comp.x0);
+                prev.y0 = prev.y0.min(comp.y0);
+                prev.x1 = prev.x1.max(comp.x1);
+                prev.y1 = prev.y1.max(comp.y1);
+                prev.area = prev.area.saturating_add(comp.area);
+                continue;
+            }
+        }
+        out.push(comp);
+    }
+    out
+}
+
 fn line_bounds(comps: &[Comp], line: &[usize]) -> (i32, i32, i32, i32) {
     let mut x0 = i32::MAX;
     let mut y0 = i32::MAX;
@@ -272,46 +501,210 @@ fn line_bounds(comps: &[Comp], line: &[usize]) -> (i32, i32, i32, i32) {
     (x0, y0, x1, y1)
 }
 
-fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stamp> {
-    if !(10..=16).contains(&line.len()) {
+fn on_the_digit_row(comps: Vec<Comp>, median_h: i32) -> Vec<Comp> {
+    if comps.is_empty() {
+        return comps;
+    }
+    let mut centers: Vec<i32> = comps.iter().map(|comp| (comp.y0 + comp.y1) / 2).collect();
+    centers.sort_unstable();
+    let mid = centers[centers.len() / 2];
+    comps
+        .into_iter()
+        .filter(|comp| {
+            let cy = (comp.y0 + comp.y1) / 2;
+            (cy - mid).abs() * 5 <= median_h * 3
+        })
+        .collect()
+}
+
+fn join_touching(comps: Vec<Comp>, median_h: i32) -> Vec<Comp> {
+    let mut out: Vec<Comp> = Vec::new();
+    for comp in comps {
+        if let Some(prev) = out.last_mut() {
+            let gap = comp.x0 - prev.x1 - 1;
+            let union_w = comp.x1.max(prev.x1) - comp.x0.min(prev.x0) + 1;
+            let overlap_y = prev.y1.min(comp.y1) - prev.y0.max(comp.y0) + 1;
+            // Fragments of one thin digit touch. Two neighboring digits together
+            // are wider than the line is tall.
+            if gap <= 1 && overlap_y > 0 && union_w <= median_h {
+                prev.x0 = prev.x0.min(comp.x0);
+                prev.y0 = prev.y0.min(comp.y0);
+                prev.x1 = prev.x1.max(comp.x1);
+                prev.y1 = prev.y1.max(comp.y1);
+                prev.area = prev.area.saturating_add(comp.area);
+                continue;
+            }
+        }
+        out.push(comp);
+    }
+    out
+}
+
+fn x_groups(comps: &[Comp], median_h: i32) -> Vec<Vec<Comp>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    for comp in comps {
+        if let Some(prev) = current.last() {
+            let prev: &Comp = prev;
+            if comp.x0 - prev.x1 - 1 > median_h * 2 {
+                groups.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(*comp);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize], trim: bool) -> Option<Stamp> {
+    // Dots and colon marks sit on the same line and are dropped after the
+    // height filter, so the raw count is wider than the digit count. The soft
+    // pass also keeps ridge fragments, so its raw count is wider still.
+    let limit = if trim { 120 } else { 32 };
+    if !(8..=limit).contains(&line.len()) {
         return None;
     }
-    let mut idxs = line.to_vec();
-    idxs.sort_by_key(|&i| comps[i].x0);
-    let mut heights: Vec<i32> = idxs.iter().map(|&i| comps[i].y1 - comps[i].y0 + 1).collect();
+    let mut parts: Vec<Comp> = line.iter().map(|&i| comps[i]).collect();
+    parts.sort_by_key(|comp| (comp.x0, comp.y0));
+    let mut parts = merge_stacked(parts, if trim { 4 } else { 10 });
+    if trim {
+        // A cable-slot edge is a short bar much wider than a digit.
+        parts.retain(|comp| {
+            let bw = comp.x1 - comp.x0 + 1;
+            let bh = comp.y1 - comp.y0 + 1;
+            !(bw > bh * 2 && bw > 36)
+        });
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut heights: Vec<i32> = parts.iter().map(|comp| comp.y1 - comp.y0 + 1).collect();
     heights.sort_unstable();
-    let median_h = heights[heights.len() / 2];
+    let median_h = if trim {
+        let upper = &heights[heights.len() / 2..];
+        upper[upper.len() / 2]
+    } else {
+        heights[heights.len() / 2]
+    };
     if median_h < 6 {
         return None;
     }
-    let kept: Vec<usize> = idxs
+    let kept: Vec<Comp> = parts
         .into_iter()
-        .filter(|&i| {
-            let h = comps[i].y1 - comps[i].y0 + 1;
+        .filter(|comp| {
+            let h = comp.y1 - comp.y0 + 1;
             h * 10 >= median_h * 6 && h * 10 <= median_h * 14
         })
         .collect();
+    let groups = if trim {
+        let kept = join_touching(on_the_digit_row(kept, median_h), median_h);
+        x_groups(&kept, median_h)
+    } else if (10..=16).contains(&kept.len()) {
+        vec![kept]
+    } else {
+        return None;
+    };
+    for kept in groups {
+        if let Some(stamp) = read_glyphs(mask, w, kept, median_h, trim) {
+            return Some(stamp);
+        }
+    }
+    None
+}
+
+fn read_glyphs(mask: &[u8], w: i32, kept: Vec<Comp>, median_h: i32, trim: bool) -> Option<Stamp> {
     if !(10..=16).contains(&kept.len()) {
         return None;
     }
+    // A one-pixel JPEG fringe on a soft mask turns a 9 into a 7. The stricter
+    // passes already match the glyph, and trimming them drops the score.
+    let kept: Vec<Comp> = if trim {
+        let mut centers: Vec<i32> = kept.iter().map(|comp| (comp.y0 + comp.y1) / 2).collect();
+        centers.sort_unstable();
+        let mid = centers[centers.len() / 2];
+        kept.into_iter()
+            .map(|comp| {
+                let mut comp = trim_fringe(mask, w, comp);
+                // A ridge sticks out above and below the digit and stretches the template.
+                let y0 = comp.y0.max(mid - median_h / 2);
+                let y1 = comp.y1.min(mid + median_h / 2);
+                if y1 - y0 >= 6 {
+                    comp.y0 = y0;
+                    comp.y1 = y1;
+                }
+                comp
+            })
+            .collect()
+    } else {
+        kept
+    };
     let px = px_for_height(median_h as u32);
     let glyphs = glyph_bitmaps(px)?;
-    let (x0, y0, x1, y1) = line_bounds(comps, &kept);
+    let x0 = kept.iter().map(|comp| comp.x0).min().unwrap_or(0);
+    let y0 = kept.iter().map(|comp| comp.y0).min().unwrap_or(0);
+    let x1 = kept.iter().map(|comp| comp.x1).max().unwrap_or(0);
+    let y1 = kept.iter().map(|comp| comp.y1).max().unwrap_or(0);
+    let mut gaps = Vec::with_capacity(kept.len());
+    for n in 1..kept.len() {
+        let prev = kept[n - 1];
+        let cur = kept[n];
+        let gap = cur.x0 - prev.x1 - 1;
+        gaps.push(if gap > 1 {
+            Some(inspect_gap(mask, w, prev.x1 + 1, cur.x0 - 1, y0, y1))
+        } else {
+            None
+        });
+    }
+    // A "1" is much narrower than the other digits, so the empty gap beside it
+    // looks like a word space. Measure the gap as if both neighbors had a
+    // normal digit width.
+    let typical = median_h * 6 / 10;
+    let space_width = |n: usize, width: i32| {
+        let prev = kept[n].x1 - kept[n].x0 + 1;
+        let next = kept[n + 1].x1 - kept[n + 1].x0 + 1;
+        let pad = (typical - prev).max(0) / 2 + (typical - next).max(0) / 2;
+        width - pad
+    };
+    let mut empty_widths: Vec<i32> = gaps
+        .iter()
+        .enumerate()
+        .filter_map(|(n, gap)| gap.as_ref().filter(|gap| gap.ink < 3).map(|gap| space_width(n, gap.width)))
+        .collect();
+    empty_widths.sort_unstable();
+    // Narrow digits such as "1" leave a gap that is almost as wide as a word
+    // space. When one empty gap is clearly wider than the others, only that
+    // one is the space.
+    let space_at = if empty_widths.len() >= 2 {
+        let largest = empty_widths[empty_widths.len() - 1];
+        let next = empty_widths[empty_widths.len() - 2];
+        if largest * 10 >= next * 14 { next + 1 } else { -1 }
+    } else {
+        -1
+    };
     let mut text = String::new();
-    for (n, &idx) in kept.iter().enumerate() {
+    for (n, comp) in kept.iter().enumerate() {
         if n > 0 {
-            let prev = comps[kept[n - 1]];
-            let cur = comps[idx];
-            let gap = cur.x0 - prev.x1 - 1;
-            if gap > 1 {
-                match gap_mark(mask, w, prev.x1 + 1, cur.x0 - 1, y0, y1, median_h) {
+            if let Some(gap) = &gaps[n - 1] {
+                match gap_char(gap, y0, y1, median_h, space_at, space_width(n - 1, gap.width)) {
                     Some('\0') => {}
                     Some(ch) => text.push(ch),
                     None => return None,
                 }
             }
         }
-        let ch = classify(mask, w, comps[idx], &glyphs)?;
+        let ch = match classify(mask, w, *comp, &glyphs) {
+            Some(ch) => ch,
+            // A slot edge stuck to a faint "1" never matches the font. The flag
+            // is wider than the stem, which a bare slot edge is not.
+            None if trim && narrow_one(mask, w, *comp) => '1',
+            None if trim => match thicken(mask, w, *comp, &glyphs) {
+                Some(ch) => ch,
+                None => return None,
+            },
+            None => return None,
+        };
         text.push(ch);
     }
     let parsed = parse_stamp(&text)?;
@@ -327,10 +720,22 @@ fn read_line(mask: &[u8], w: i32, comps: &[Comp], line: &[usize]) -> Option<Stam
     })
 }
 
-fn gap_mark(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32, line_h: i32) -> Option<char> {
-    if x1 < x0 {
-        return Some('\0');
-    }
+struct GapInk {
+    width: i32,
+    ink: u32,
+    runs: u32,
+    /// Tallest vertical run. A colon dot is short; a broken slot edge is not.
+    max_run: i32,
+    /// Longest empty stretch after a real run, before the next ink.
+    hole: i32,
+    gh: i32,
+    gw: i32,
+    mid: i32,
+    /// Ink in the top and bottom thirds with an empty middle: the two dots of a colon.
+    colon_like: bool,
+}
+
+fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapInk {
     let mut ink = 0u32;
     let mut ix0 = i32::MAX;
     let mut iy0 = i32::MAX;
@@ -351,37 +756,94 @@ fn gap_mark(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32, line_h: i32
         }
         rows.push(on);
     }
-    let wide = (x1 - x0 + 1) * 10 > line_h * 3;
-    if ink < 3 {
+    // A single bright row is JPEG noise. A colon dot and a decimal dot are taller.
+    let mut runs = 0u32;
+    let mut max_run = 0i32;
+    let mut hole = 0i32;
+    let mut gap_len = 0i32;
+    let mut seen_run = false;
+    let mut prev = false;
+    let mut run_len = 0i32;
+    for on in &rows {
+        if *on {
+            if seen_run {
+                hole = hole.max(gap_len);
+            }
+            gap_len = 0;
+            run_len += 1;
+            prev = true;
+        } else {
+            if prev && run_len > 1 {
+                runs += 1;
+                max_run = max_run.max(run_len);
+                seen_run = true;
+            }
+            if seen_run {
+                gap_len += 1;
+            }
+            prev = false;
+            run_len = 0;
+        }
+    }
+    if prev && run_len > 1 {
+        runs += 1;
+        max_run = max_run.max(run_len);
+    }
+    let third = rows.len() / 3;
+    let colon_like = third > 0
+        && rows[..third].iter().any(|on| *on)
+        && rows[rows.len() - third..].iter().any(|on| *on)
+        && rows[third..rows.len() - third].iter().all(|on| !*on);
+    GapInk {
+        width: x1 - x0 + 1,
+        ink,
+        runs,
+        max_run,
+        hole,
+        gh: if ink == 0 { 0 } else { iy1 - iy0 + 1 },
+        gw: if ink == 0 { 0 } else { ix1 - ix0 + 1 },
+        mid: if ink == 0 { 0 } else { (iy0 + iy1) / 2 },
+        colon_like,
+    }
+}
+
+fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32, space_width: i32) -> Option<char> {
+    let wide = if space_at >= 0 {
+        space_width >= space_at
+    } else {
+        space_width * 10 > line_h * 3
+    };
+    if gap.ink < 3 {
         return if wide { Some(' ') } else { Some('\0') };
     }
-    let mut runs = 0;
-    let mut prev = false;
-    for on in rows {
-        if on && !prev {
-            runs += 1;
-        }
-        prev = on;
-    }
-    if runs == 2 {
+    // A crack between digits, or a seam only a few pixels wide, is not a colon.
+    // A broken slot edge is two long runs; a colon is two short dots.
+    let short_dots = gap.runs == 2 && gap.max_run * 3 <= line_h;
+    // The seam through a cabinet colon stretches one dot, but the two marks
+    // are still separated. A broken slot edge has only a few empty rows.
+    let split_dots = gap.runs == 2 && gap.hole >= 8 && gap.max_run * 2 <= line_h;
+    if gap.width >= 8 && (short_dots || split_dots || (gap.colon_like && gap.gw * 2 <= line_h && gap.ink < 250)) {
         return Some(':');
     }
-    if runs == 1 {
-        let gh = iy1 - iy0 + 1;
-        let gw = ix1 - ix0 + 1;
-        let mid = (iy0 + iy1) / 2;
+    if gap.runs == 1 {
         let line_mid = (y0 + y1) / 2;
-        if gh * 10 <= line_h * 5 && gw >= gh && (mid - line_mid).abs() * 2 <= line_h {
+        let centered = (gap.mid - line_mid).abs() * 5 <= line_h;
+        let low = gap.mid >= y0 + line_h * 3 / 5;
+        if gap.gh * 10 <= line_h * 5 && gap.gw >= gap.gh.saturating_mul(2) && centered {
             return Some('-');
         }
-        if gh * 10 <= line_h * 5 && gw * 10 <= gh * 16 && mid > line_mid {
+        if gap.gh * 10 <= line_h * 6 && gap.gw * 10 <= gap.gh * 18 && low {
             return Some('.');
         }
     }
-    if wide {
-        return None;
+    if gap.gh * 3 <= line_h && gap.gw * 3 <= line_h {
+        return Some('\0');
     }
-    Some('\0')
+    // A slot edge in the gap is one tall, thin mark. It is not a separator.
+    if gap.max_run * 3 >= line_h && gap.gw * 3 <= line_h {
+        return Some('\0');
+    }
+    if wide { None } else { Some('\0') }
 }
 
 struct GlyphBmp {
@@ -409,9 +871,141 @@ fn glyph_bitmaps(px: f32) -> Option<Vec<GlyphBmp>> {
     Some(out)
 }
 
+/// A faint "1" with a slot edge stuck to its right. The font score stays low
+/// because the stem is only a couple of levels above a white duct, so the shape
+/// is checked directly: a flag wider than the stem, and not a bare vertical bar.
+fn narrow_one(mask: &[u8], w: i32, comp: Comp) -> bool {
+    let bw = comp.x1 - comp.x0 + 1;
+    let bh = comp.y1 - comp.y0 + 1;
+    if bw < 3 || bh < 12 {
+        return false;
+    }
+    let mut cols = vec![0i32; bw as usize];
+    for y in comp.y0..=comp.y1 {
+        for x in comp.x0..=comp.x1 {
+            if mask[(y * w + x) as usize] != 0 {
+                cols[(x - comp.x0) as usize] += 1;
+            }
+        }
+    }
+    let mut right = bw as usize;
+    let low = 4.max(bh / 8);
+    let tall = bh * 4 / 5;
+    if let Some(bar_at) = cols.iter().enumerate().rev().find(|(_, c)| **c >= tall).map(|(i, _)| i) {
+        if bar_at + 5 >= cols.len() {
+            let mut bar_left = bar_at;
+            while bar_left > 0 && cols[bar_left - 1] > low && bar_at + 1 - (bar_left - 1) <= 4 {
+                bar_left -= 1;
+            }
+            if bar_at + 1 - bar_left <= 4 && bar_left >= 4 {
+                let mut valley_left = bar_left;
+                let mut valley = 0i32;
+                while valley_left > 0 && cols[valley_left - 1] <= low {
+                    valley_left -= 1;
+                    valley += 1;
+                }
+                if valley >= 4 && cols[..valley_left].iter().copied().max().unwrap_or(0) >= bh / 2 {
+                    right = valley_left;
+                }
+            }
+        }
+    }
+    let kept = right as i32;
+    if kept < 3 || kept * 10 > bh * 5 {
+        return false;
+    }
+    let top_end = comp.y0 + bh * 35 / 100;
+    let stem_from = comp.y0 + bh / 2;
+    let mut top_width = 0i32;
+    let mut stem_widths = Vec::new();
+    let mut rows_on = 0i32;
+    let mut middle_on = false;
+    let mid0 = comp.y0 + bh / 3;
+    let mid1 = comp.y0 + bh * 2 / 3;
+    for y in comp.y0..=comp.y1 {
+        let mut n = 0i32;
+        for x in comp.x0..comp.x0 + kept {
+            if mask[(y * w + x) as usize] != 0 {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            rows_on += 1;
+        }
+        if y <= top_end {
+            top_width = top_width.max(n);
+        }
+        if y >= stem_from {
+            stem_widths.push(n);
+        }
+        if y >= mid0 && y <= mid1 && n > 0 {
+            middle_on = true;
+        }
+    }
+    if !middle_on || rows_on * 10 < bh * 6 || stem_widths.is_empty() {
+        return false;
+    }
+    stem_widths.sort_unstable();
+    let stem = stem_widths[stem_widths.len() / 2];
+    // A slot edge is the same width from top to bottom. A "1" has a flag.
+    stem >= 1 && top_width >= stem + 2
+}
+
+fn trim_fringe(mask: &[u8], w: i32, mut comp: Comp) -> Comp {
+    let row_ink = |y: i32, comp: Comp| -> i32 {
+        (comp.x0..=comp.x1).filter(|&x| mask[(y * w + x) as usize] != 0).count() as i32
+    };
+    let col_ink = |x: i32, comp: Comp| -> i32 {
+        (comp.y0..=comp.y1).filter(|&y| mask[(y * w + x) as usize] != 0).count() as i32
+    };
+    while comp.y0 < comp.y1 && row_ink(comp.y0, comp) < 3 {
+        comp.y0 += 1;
+    }
+    while comp.y1 > comp.y0 && row_ink(comp.y1, comp) < 3 {
+        comp.y1 -= 1;
+    }
+    while comp.x0 < comp.x1 && col_ink(comp.x0, comp) < 3 {
+        comp.x0 += 1;
+    }
+    while comp.x1 > comp.x0 && col_ink(comp.x1, comp) < 3 {
+        comp.x1 -= 1;
+    }
+    comp
+}
+
 fn classify(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> Option<char> {
     let (ch, score) = classify_scored(mask, w, comp, glyphs);
     if score >= 0.38 { Some(ch) } else { None }
+}
+
+/// A thin stroke on a white surface is the same digit, one pixel short of the
+/// bold template. Thicken it only when the thin shape already prefers that digit.
+fn thicken(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> Option<char> {
+    let (ch, score) = classify_scored(mask, w, comp, glyphs);
+    if score < 0.25 || !ch.is_ascii_digit() {
+        return None;
+    }
+    let mut thick = mask.to_vec();
+    for y in comp.y0..=comp.y1 {
+        for x in comp.x0..=comp.x1 {
+            let i = (y * w + x) as usize;
+            if mask[i] != 0 {
+                continue;
+            }
+            let near = [(0, 1), (0, -1), (1, 0), (-1, 0)].iter().any(|&(dy, dx)| {
+                let yy = y + dy;
+                let xx = x + dx;
+                (comp.y0..=comp.y1).contains(&yy)
+                    && (comp.x0..=comp.x1).contains(&xx)
+                    && mask[(yy * w + xx) as usize] != 0
+            });
+            if near {
+                thick[i] = 1;
+            }
+        }
+    }
+    let (again, score) = classify_scored(&thick, w, comp, glyphs);
+    if again == ch && score >= 0.38 { Some(ch) } else { None }
 }
 
 fn classify_scored(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> (char, f32) {
@@ -914,6 +1508,100 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CameraTimeError::Invalid));
         assert_eq!(image.as_raw(), before.as_raw());
+    }
+
+    #[test]
+    fn light_wall_stamp_with_dots_is_found() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912.jpg");
+        let input = crate::image_io::decode_path(&path).expect("panel photo");
+        let found = detect_camera_time(&input.rgba).expect("date on the light wall");
+        assert_eq!(found.text, "2026.11.05 09:12");
+        assert_eq!(found.separator, '.');
+        assert_eq!(found.second, None);
+        let mut image = input.rgba.clone();
+        let change = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+        )
+        .unwrap();
+        assert_eq!(change.original, "2026.11.05 09:12");
+        assert_eq!(change.updated, "2026.12.01 09:30");
+        let again = detect_camera_time(&image).expect("rewritten dotted date");
+        assert_eq!(again.text, "2026.12.01 09:30");
+        assert_eq!(again.separator, '.');
+        let mut stray = 0u32;
+        for y in 0..image.height() {
+            for x in 0..2200 {
+                if image.get_pixel(x, y).0 != input.rgba.get_pixel(x, y).0 {
+                    stray += 1;
+                }
+            }
+        }
+        assert_eq!(stray, 0, "pixels changed outside the date on the right");
+    }
+
+    #[test]
+    fn cabinet_stamp_cut_by_a_seam_is_found() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912-cabinet.jpg");
+        let input = crate::image_io::decode_path(&path).expect("cabinet photo");
+        let found = detect_camera_time(&input.rgba).expect("date beside the seam");
+        assert_eq!(found.text, "2026.11.05 09:12");
+        assert_eq!(found.separator, '.');
+        assert_eq!(found.second, None);
+        let mut image = input.rgba.clone();
+        let change = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+        )
+        .unwrap();
+        assert_eq!(change.original, "2026.11.05 09:12");
+        assert_eq!(change.updated, "2026.12.01 09:30");
+        // The cabinet seam still crosses the first 0, so the redrawn glyphs
+        // are not always read back. A second read must not invent another time.
+        if let Some(again) = detect_camera_time(&image) {
+            assert_eq!(again.text, "2026.12.01 09:30");
+            assert_eq!(again.separator, '.');
+        }
+        let mut stray = 0u32;
+        for y in 0..image.height() {
+            for x in 0..2400 {
+                if image.get_pixel(x, y).0 != input.rgba.get_pixel(x, y).0 {
+                    stray += 1;
+                }
+            }
+        }
+        assert_eq!(stray, 0, "pixels changed on the model line");
+    }
+
+    #[test]
+    fn white_duct_stamp_is_found() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0919-duct.jpg");
+        let input = crate::image_io::decode_path(&path).expect("duct photo");
+        let found = detect_camera_time(&input.rgba).expect("date on the white duct");
+        assert_eq!(found.text, "2026.11.05 09:19");
+        assert_eq!(found.separator, '.');
+        assert_eq!(found.second, None);
+        let mut image = input.rgba.clone();
+        let change = edit_camera_time(
+            &mut image,
+            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+        )
+        .unwrap();
+        assert_eq!(change.original, "2026.11.05 09:19");
+        assert_eq!(change.updated, "2026.12.01 09:30");
+        if let Some(again) = detect_camera_time(&image) {
+            assert_eq!(again.text, "2026.12.01 09:30");
+            assert_eq!(again.separator, '.');
+        }
+        let mut stray = 0u32;
+        for y in 0..image.height() {
+            for x in 0..2400 {
+                if image.get_pixel(x, y).0 != input.rgba.get_pixel(x, y).0 {
+                    stray += 1;
+                }
+            }
+        }
+        assert_eq!(stray, 0, "pixels changed on the model line");
     }
 
     #[test]
