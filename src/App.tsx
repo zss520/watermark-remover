@@ -759,9 +759,6 @@ function ReportView({ report }: { report: Report }) {
       ) : report.cameraTime ? (
         <p className="note">相机时间已改写，字号和粗细按原水印匹配。机型那一行没有改。</p>
       ) : null}
-      {report.flags.includes("surface_filled") ? (
-        <p className="note">模板对不上这张图，字的位置已按周围表面补上，不再保留字下的细节。</p>
-      ) : null}
       {report.flags.includes("camera_time_missing") ? <p className="note">没有找到可改的相机时间，日期保持原样。</p> : null}
       {report.flags.includes("camera_time_invalid") ? <p className="note">日期或时间不合法，没有改相机时间。</p> : null}
       {report.flags.includes("camera_time_skipped") ? <p className="note">这张图还没写出结果，相机时间也没有改。</p> : null}

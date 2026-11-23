@@ -222,7 +222,7 @@ fn ncc(a: &[f32], b: &[f32]) -> f32 {
 /// Laplace fill of the sprite rectangle. The 4 px ring outside the rectangle
 /// is the Dirichlet boundary. Initialized to the ring mean so a flat plate
 /// is already the solution.
-pub(crate) fn background(image: &RgbaImage, x0: i32, y0: i32, w: i32, h: i32) -> [Vec<f32>; 3] {
+fn background(image: &RgbaImage, x0: i32, y0: i32, w: i32, h: i32) -> [Vec<f32>; 3] {
     let iw = image.width() as i32;
     let ih = image.height() as i32;
     let mut planes = [Vec::new(), Vec::new(), Vec::new()];

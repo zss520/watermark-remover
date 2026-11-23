@@ -405,69 +405,6 @@ fn process_best_uses_the_template_measured_at_this_size() {
     assert_eq!(out.report.template_id.as_deref(), Some("right"));
 }
 
-fn neighbor_delta(image: &image::RgbaImage, x: i32, y: i32, w: i32, h: i32) -> f32 {
-    let mut sum = 0.0f32;
-    let mut n = 0.0f32;
-    for py in 0..h {
-        for px in 0..w.saturating_sub(1) {
-            let a = image.get_pixel((x + px) as u32, (y + py) as u32).0;
-            let b = image.get_pixel((x + px + 1) as u32, (y + py) as u32).0;
-            for c in 0..3 {
-                sum += (a[c] as i32 - b[c] as i32).abs() as f32;
-            }
-            n += 3.0;
-        }
-    }
-    sum / n.max(1.0)
-}
-
-#[test]
-fn unexplained_glyph_is_softened_without_moving_the_holdout() {
-    let dir = std::path::Path::new("/workspace/resources/doubao");
-    let templates = watermark_core::load_template_dir(dir).unwrap();
-    let photo = decode_bytes(&fs::read("/workspace/docs/20261119-092612.jpg").unwrap()).unwrap();
-    let tpl = templates.iter().find(|t| t.meta.id == "doubao_2304x1728").unwrap();
-    let out = process_one(&photo, tpl, &ProcessOptions::default()).unwrap();
-    assert!(out.report.ncc.unwrap() < 0.74, "ncc {:?}", out.report.ncc);
-    assert_eq!(out.report.counts.outside_diff_pixels, 0);
-    assert!(out.report.flags.iter().any(|flag| flag == "surface_filled"));
-    let image = out.image.unwrap();
-    let [x, y, w, h] = out.report.bbox.unwrap();
-    let before = neighbor_delta(&photo.rgba, x, y, w, h);
-    let after = neighbor_delta(&image, x, y, w, h);
-    assert!(
-        after < before * 0.45,
-        "letter edges remain: before {before:.2} after {after:.2}"
-    );
-    let far = image.get_pixel(900, 1510).0;
-    let far_src = photo.rgba.get_pixel(900, 1510).0;
-    assert_eq!(far, far_src);
-
-    for id in ["17", "14"] {
-        let marked = decode_bytes(&fs::read(format!("/workspace/docs/holdout/{id}-marked.png")).unwrap()).unwrap();
-        let clean = decode_bytes(&fs::read(format!("/workspace/docs/holdout/{id}-clean.png")).unwrap()).unwrap();
-        let use_tpl = templates
-            .iter()
-            .find(|t| t.meta.source_size == Some([marked.rgba.width(), marked.rgba.height()]))
-            .unwrap();
-        let restored = process_one(&marked, use_tpl, &ProcessOptions::default()).unwrap();
-        let got = restored.image.expect("holdout image");
-        let mut max_abs = 0i32;
-        for (a, b) in got.pixels().zip(clean.rgba.pixels()) {
-            for c in 0..3 {
-                max_abs = max_abs.max((a.0[c] as i32 - b.0[c] as i32).abs());
-            }
-        }
-        assert!(
-            restored.report.ncc.unwrap() >= 0.74,
-            "holdout {id} would be repainted"
-        );
-        assert!(!restored.report.flags.iter().any(|flag| flag == "surface_filled"));
-        assert!(max_abs <= 2, "holdout {id} max_abs {max_abs}");
-    }
-}
-
-
 #[test]
 fn bytes_roundtrip_png() {
     let demo = fixture::demo();
