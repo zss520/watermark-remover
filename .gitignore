@@ -8,3 +8,4 @@ templates-src/*
 !templates-src/.gitkeep
 src-tauri/target
 src-tauri/gen
+.vite/
