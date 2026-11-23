@@ -430,14 +430,27 @@ fn unexplained_glyph_is_softened_without_moving_the_holdout() {
     let out = process_one(&photo, tpl, &ProcessOptions::default()).unwrap();
     assert!(out.report.ncc.unwrap() < 0.74, "ncc {:?}", out.report.ncc);
     assert_eq!(out.report.counts.outside_diff_pixels, 0);
-    assert!(out.report.flags.iter().any(|flag| flag == "surface_filled"));
+    assert!(out.report.flags.iter().any(|flag| flag == "glyph_cleaned"));
     let image = out.image.unwrap();
     let [x, y, w, h] = out.report.bbox.unwrap();
+    let found = watermark_core::locate(&photo.rgba, tpl);
+    // Corners of the box are not the letters. A rectangle fill would change them.
+    for (px, py) in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)] {
+        let a = found.alpha[(py * w + px) as usize];
+        assert!(a < 0.02, "corner alpha {a} at {px},{py}");
+        let got = image.get_pixel((x + px) as u32, (y + py) as u32).0;
+        let src = photo.rgba.get_pixel((x + px) as u32, (y + py) as u32).0;
+        assert_eq!(got, src, "corner {px},{py} was painted");
+    }
     let before = neighbor_delta(&photo.rgba, x, y, w, h);
     let after = neighbor_delta(&image, x, y, w, h);
     assert!(
-        after < before * 0.45,
+        after < before * 0.4,
         "letter edges remain: before {before:.2} after {after:.2}"
+    );
+    assert!(
+        after > 1.0,
+        "the whole box was flattened: before {before:.2} after {after:.2}"
     );
     let far = image.get_pixel(900, 1510).0;
     let far_src = photo.rgba.get_pixel(900, 1510).0;
@@ -462,7 +475,7 @@ fn unexplained_glyph_is_softened_without_moving_the_holdout() {
             restored.report.ncc.unwrap() >= 0.74,
             "holdout {id} would be repainted"
         );
-        assert!(!restored.report.flags.iter().any(|flag| flag == "surface_filled"));
+        assert!(!restored.report.flags.iter().any(|flag| flag == "glyph_cleaned"));
         assert!(max_abs <= 2, "holdout {id} max_abs {max_abs}");
     }
 }

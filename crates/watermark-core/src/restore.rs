@@ -2,7 +2,7 @@ use crate::blend::{inverse_u8, BlendMode};
 use crate::camera_time::{self, CameraTimeError, CameraTimeValue};
 use crate::color::ColorSpace;
 use crate::image_io::{encode_jpeg, encode_png, patch_exif_orientation_to_top_left, png_insert_chunk, InputImage};
-use crate::locate::{background, locate, manual_match, Match};
+use crate::locate::{locate, manual_match, Match};
 use crate::placement::Placement;
 use crate::report::{confirmation_required, decide, Counts, Decision, InputInfo, OutputInfo, Report, Verdict};
 use crate::template::LoadedTemplate;
@@ -166,15 +166,17 @@ fn restore_match(
     }
 
     let place = found.placement.clone().ok_or_else(|| Error::Template("没有放置结果".into()))?;
-    let (mut image, counts, mut coverage, probe) = invert(input, template, &place, &found.alpha, &found.bias);
+    let (mut image, counts, coverage, probe) = invert(input, template, &place, &found.alpha, &found.bias);
     // The synthetic holdout that still passes sits at NCC >= 0.758.
     // Real exports the plate does not explain (measured at 0.60 and 0.71)
-    // keep a readable copy of the letters after the inverse. Below that
-    // band, repaint the whole rectangle from the surrounding surface.
+    // keep a colored copy of the letters after the inverse. Below that
+    // band, repaint only the strokes from the picture beside them.
     // 0.74 stays under the passing holdout so those pixels are not touched.
+    // The rectangle itself stays, so a flat blur does not replace the scene.
+    let sprite = bbox_of(place);
     let repainted = found.ncc < 0.74;
     if repainted {
-        soften_unexplained_glyph(&input.rgba, &mut image, &mut coverage);
+        clean_unexplained_glyph(&mut image, &found.alpha, sprite, &coverage);
     }
     let outside = outside_diff(&input.rgba, &image, &coverage);
     // The inverter only writes evaluation-mask pixels. A non-zero diff means
@@ -191,7 +193,7 @@ fn restore_match(
     };
     let (verdict, mut flags) = decide(&decision);
     if repainted && outside == 0 {
-        flags.push("surface_filled".into());
+        flags.push("glyph_cleaned".into());
     }
     let mut counts = counts;
     counts.outside_diff_pixels = outside;
@@ -409,47 +411,168 @@ fn invert(
     (out, counts, coverage, probe)
 }
 
-fn soften_unexplained_glyph(original: &RgbaImage, image: &mut RgbaImage, coverage: &mut Coverage) {
-    let w = coverage.width as i32;
-    let h = coverage.height as i32;
-    if w <= 0 || h <= 0 {
+fn clean_unexplained_glyph(
+    image: &mut RgbaImage,
+    alpha: &[f32],
+    sprite: [i32; 4],
+    coverage: &Coverage,
+) {
+    let [x0, y0, sw, sh] = sprite;
+    let cw = coverage.width as i32;
+    let ch = coverage.height as i32;
+    if sw <= 0 || sh <= 0 || cw <= 0 || ch <= 0 || alpha.len() < (sw * sh) as usize {
         return;
     }
-    // The glyph mask leaves the counters of the letters untouched, so a fill
-    // of only the strokes still draws the characters. The whole rectangle is
-    // the region that may change.
-    for flag in &mut coverage.evaluate {
-        *flag = true;
+    let n = (cw * ch) as usize;
+    let mut stroke = vec![false; n];
+    for py in 0..sh {
+        for px in 0..sw {
+            let a = alpha[(py * sw + px) as usize];
+            if a <= 0.08 {
+                continue;
+            }
+            let ix = x0 + px - coverage.x;
+            let iy = y0 + py - coverage.y;
+            if ix < 0 || iy < 0 || ix >= cw || iy >= ch {
+                continue;
+            }
+            // Cover the colored fringe, but stay inside the existing mask so
+            // pixels outside the watermark stay byte-identical.
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    if dx * dx + dy * dy > 5 {
+                        continue;
+                    }
+                    let nx = ix + dx;
+                    let ny = iy + dy;
+                    if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                        continue;
+                    }
+                    let ni = (ny * cw + nx) as usize;
+                    if coverage.evaluate.get(ni) == Some(&true) {
+                        stroke[ni] = true;
+                    }
+                }
+            }
+        }
     }
-    // Continue the pixels just outside this rectangle inward. That border is
-    // not the glyph, so the letters cannot reappear in the fill.
-    let bg = background(original, coverage.x, coverage.y, w, h);
-    let iw = image.width() as i32;
-    let ih = image.height() as i32;
-    for iy in 0..h {
-        for ix in 0..w {
-            let ci = (iy * w + ix) as usize;
-            if bg[0].get(ci).is_none() {
+    let mut color = vec![[0.0f32; 3]; n];
+    let mut detail = vec![[0.0f32; 3]; n];
+    for y in 0..ch {
+        for x in 0..cw {
+            let px = coverage.x + x;
+            let py = coverage.y + y;
+            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
                 continue;
             }
-            let x = coverage.x + ix;
-            let y = coverage.y + iy;
-            if x < 0 || y < 0 || x >= iw || y >= ih {
-                continue;
-            }
-            // The outer pixels are already the surrounding surface. Blend them
-            // so the filled rectangle does not end in a hard edge.
-            let edge = ix.min(iy).min(w - 1 - ix).min(h - 1 - iy) as f32;
-            let weight = (edge / 4.0).clamp(0.0, 1.0);
-            let kept = original.get_pixel(x as u32, y as u32).0;
-            let mut src = kept;
+            let p = image.get_pixel(px as u32, py as u32).0;
+            let i = (y * cw + x) as usize;
             for c in 0..3 {
-                let filled = bg[c][ci] * 255.0;
-                src[c] = (kept[c] as f32 * (1.0 - weight) + filled * weight)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                color[i][c] = p[c] as f32;
             }
-            image.put_pixel(x as u32, y as u32, image::Rgba(src));
+        }
+    }
+    for y in 1..ch - 1 {
+        for x in 1..cw - 1 {
+            let i = (y * cw + x) as usize;
+            if stroke[i] {
+                continue;
+            }
+            for c in 0..3 {
+                let mut acc = 0.0f32;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        acc += color[((y + dy) * cw + (x + dx)) as usize][c];
+                    }
+                }
+                detail[i][c] = color[i][c] - acc / 9.0;
+            }
+        }
+    }
+    // Continue the pixels just outside the strokes. Counters and the rest of
+    // the frame stay on the inverse, so lines and texture are not blurred away.
+    for pass in 0..80 {
+        let reverse = pass % 2 == 1;
+        for k in 0..ch {
+            let y = if reverse { ch - 1 - k } else { k };
+            for t in 0..cw {
+                let x = if reverse { cw - 1 - t } else { t };
+                let i = (y * cw + x) as usize;
+                if !stroke[i] {
+                    continue;
+                }
+                let mut acc = [0.0f32; 3];
+                let mut count = 0.0f32;
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                        continue;
+                    }
+                    let j = (ny * cw + nx) as usize;
+                    for c in 0..3 {
+                        acc[c] += color[j][c];
+                    }
+                    count += 1.0;
+                }
+                if count > 0.0 {
+                    for c in 0..3 {
+                        color[i][c] = acc[c] / count;
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            let i = (y * cw + x) as usize;
+            if !stroke[i] {
+                continue;
+            }
+            let px = coverage.x + x;
+            let py = coverage.y + y;
+            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
+                continue;
+            }
+            let mut nearest = None;
+            let mut best = i32::MAX;
+            for dy in -8..=8 {
+                for dx in -8..=8 {
+                    if dx * dx + dy * dy > 64 {
+                        continue;
+                    }
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                        continue;
+                    }
+                    let j = (ny * cw + nx) as usize;
+                    if stroke[j] {
+                        continue;
+                    }
+                    let d = dx * dx + dy * dy;
+                    if d < best {
+                        best = d;
+                        nearest = Some((nx, ny));
+                    }
+                }
+            }
+            let mut pixel = image.get_pixel(px as u32, py as u32).0;
+            for c in 0..3 {
+                let mut value = color[i][c];
+                if let Some((nx, ny)) = nearest {
+                    let rx = nx + (nx - x);
+                    let ry = ny + (ny - y);
+                    if rx >= 0 && ry >= 0 && rx < cw && ry < ch {
+                        let j = (ry * cw + rx) as usize;
+                        if !stroke[j] {
+                            value += detail[j][c].clamp(-16.0, 16.0);
+                        }
+                    }
+                }
+                pixel[c] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            image.put_pixel(px as u32, py as u32, image::Rgba(pixel));
         }
     }
 }
