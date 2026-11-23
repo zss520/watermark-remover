@@ -61,6 +61,8 @@ struct Stamp {
     separator: char,
     has_second: bool,
     text: String,
+    /// Glyph pixels in `x0..=x1`, `y0..=y1`, row-major. The picture between them stays.
+    ink: Vec<u8>,
 }
 
 pub fn detect_camera_time(image: &RgbaImage) -> Option<DetectedCameraTime> {
@@ -79,23 +81,37 @@ pub fn detect_camera_time(image: &RgbaImage) -> Option<DetectedCameraTime> {
 }
 
 pub fn is_valid_camera_time(value: CameraTimeValue) -> bool {
-    valid_clock(value.hour, value.minute, value.second) && valid_date(value.year, value.month, value.day)
+    valid_clock(value.hour, value.minute, value.second)
+        && valid_date(value.year, value.month, value.day)
 }
 
-pub fn edit_camera_time(image: &mut RgbaImage, value: CameraTimeValue) -> Result<CameraTimeChange, CameraTimeError> {
+pub fn edit_camera_time(
+    image: &mut RgbaImage,
+    value: CameraTimeValue,
+) -> Result<CameraTimeChange, CameraTimeError> {
     if !is_valid_camera_time(value) {
         return Err(CameraTimeError::Invalid);
     }
     let stamp = find_stamp(image).ok_or(CameraTimeError::NotFound)?;
     let second = if stamp.has_second {
-        value.second.or_else(|| parse_stamp(&stamp.text).and_then(|p| p.5))
+        value
+            .second
+            .or_else(|| parse_stamp(&stamp.text).and_then(|p| p.5))
     } else {
         None
     };
-    let updated = format_stamp(stamp.separator, stamp.has_second, value.year, value.month, value.day, value.hour, value.minute, second);
+    let updated = format_stamp(
+        stamp.separator,
+        stamp.has_second,
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        second,
+    );
     let color = ink_color(image, stamp.x0, stamp.y0, stamp.x1, stamp.y1);
-    let (bg, cutoff) = background(image, stamp.x0, stamp.y0, stamp.x1, stamp.y1);
-    erase_and_inpaint(image, stamp.x0, stamp.y0, stamp.x1, stamp.y1, bg, cutoff);
+    erase_stamp(image, &stamp);
     let px = px_for_height(stamp.height.max(1) as u32);
     let cx = (stamp.x0 + stamp.x1) / 2;
     let cy = (stamp.y0 + stamp.y1) / 2;
@@ -332,7 +348,16 @@ fn stamp_from_mask(mask: &[u8], w: i32, h: i32, trim: bool) -> Option<Stamp> {
 }
 
 fn darkest_ring(image: &RgbaImage, x: i32, y: i32, w: i32, h: i32) -> i32 {
-    const RING: [(i32, i32); 8] = [(8, 0), (-8, 0), (0, 8), (0, -8), (6, 6), (6, -6), (-6, 6), (-6, -6)];
+    const RING: [(i32, i32); 8] = [
+        (8, 0),
+        (-8, 0),
+        (0, 8),
+        (0, -8),
+        (6, 6),
+        (6, -6),
+        (-6, 6),
+        (-6, -6),
+    ];
     let mut samples = [255i32; 8];
     let mut n = 0;
     for (dx, dy) in RING {
@@ -392,7 +417,13 @@ fn components(mask: &[u8], w: i32, h: i32) -> Vec<Comp> {
             if bh < 2 || bw > 80 || bh > 80 || area < 2 || area > 4000 {
                 continue;
             }
-            comps.push(Comp { x0, y0, x1, y1, area });
+            comps.push(Comp {
+                x0,
+                y0,
+                x1,
+                y1,
+                area,
+            });
         }
     }
     comps
@@ -437,7 +468,10 @@ fn split_wide_gaps(comps: &[Comp], line: &[usize]) -> Vec<Vec<usize>> {
     if idxs.is_empty() {
         return Vec::new();
     }
-    let mut heights: Vec<i32> = idxs.iter().map(|&i| comps[i].y1 - comps[i].y0 + 1).collect();
+    let mut heights: Vec<i32> = idxs
+        .iter()
+        .map(|&i| comps[i].y1 - comps[i].y0 + 1)
+        .collect();
     heights.sort_unstable();
     let upper = &heights[heights.len() / 2..];
     let typical = upper[upper.len() / 2].max(1);
@@ -670,7 +704,11 @@ fn read_glyphs(mask: &[u8], w: i32, kept: Vec<Comp>, median_h: i32, trim: bool) 
     let mut empty_widths: Vec<i32> = gaps
         .iter()
         .enumerate()
-        .filter_map(|(n, gap)| gap.as_ref().filter(|gap| gap.ink < 3).map(|gap| space_width(n, gap.width)))
+        .filter_map(|(n, gap)| {
+            gap.as_ref()
+                .filter(|gap| gap.ink < 3)
+                .map(|gap| space_width(n, gap.width))
+        })
         .collect();
     empty_widths.sort_unstable();
     // Narrow digits such as "1" leave a gap that is almost as wide as a word
@@ -679,17 +717,36 @@ fn read_glyphs(mask: &[u8], w: i32, kept: Vec<Comp>, median_h: i32, trim: bool) 
     let space_at = if empty_widths.len() >= 2 {
         let largest = empty_widths[empty_widths.len() - 1];
         let next = empty_widths[empty_widths.len() - 2];
-        if largest * 10 >= next * 14 { next + 1 } else { -1 }
+        if largest * 10 >= next * 14 {
+            next + 1
+        } else {
+            -1
+        }
     } else {
         -1
     };
     let mut text = String::new();
+    // Dots, hyphens and colons are gaps, not digit components. Their pixels
+    // still have to be erased or the old mark stays beside the new time.
+    let mut separators = Vec::new();
     for (n, comp) in kept.iter().enumerate() {
         if n > 0 {
             if let Some(gap) = &gaps[n - 1] {
-                match gap_char(gap, y0, y1, median_h, space_at, space_width(n - 1, gap.width)) {
+                match gap_char(
+                    gap,
+                    y0,
+                    y1,
+                    median_h,
+                    space_at,
+                    space_width(n - 1, gap.width),
+                ) {
                     Some('\0') => {}
-                    Some(ch) => text.push(ch),
+                    Some(ch) => {
+                        if matches!(ch, '-' | '.' | ':') && gap.ink >= 3 {
+                            separators.push((gap.ix0, gap.iy0, gap.ix1, gap.iy1));
+                        }
+                        text.push(ch);
+                    }
                     None => return None,
                 }
             }
@@ -707,7 +764,10 @@ fn read_glyphs(mask: &[u8], w: i32, kept: Vec<Comp>, median_h: i32, trim: bool) 
         };
         text.push(ch);
     }
-    let parsed = parse_stamp(&text)?;
+    let parsed = match parse_stamp(&text) {
+        Some(parsed) => parsed,
+        None => return None,
+    };
     Some(Stamp {
         x0,
         y0,
@@ -717,7 +777,59 @@ fn read_glyphs(mask: &[u8], w: i32, kept: Vec<Comp>, median_h: i32, trim: bool) 
         separator: parsed.6,
         has_second: parsed.5.is_some(),
         text,
+        ink: glyph_ink(mask, w, &kept, &separators, x0, y0, x1, y1),
     })
+}
+
+fn glyph_ink(
+    mask: &[u8],
+    w: i32,
+    kept: &[Comp],
+    separators: &[(i32, i32, i32, i32)],
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) -> Vec<u8> {
+    let mw = (x1 - x0 + 1).max(0) as usize;
+    let mh = (y1 - y0 + 1).max(0) as usize;
+    let mut ink = vec![0u8; mw.saturating_mul(mh)];
+    if mw == 0 || mh == 0 {
+        return ink;
+    }
+    for comp in kept {
+        for y in comp.y0..=comp.y1 {
+            for x in comp.x0..=comp.x1 {
+                if y < 0 || x < 0 || x >= w {
+                    continue;
+                }
+                let src = (y * w + x) as usize;
+                if src >= mask.len() || mask[src] == 0 {
+                    continue;
+                }
+                let ix = (x - x0) as usize;
+                let iy = (y - y0) as usize;
+                if ix < mw && iy < mh {
+                    ink[iy * mw + ix] = 1;
+                }
+            }
+        }
+    }
+    for &(sx0, sy0, sx1, sy1) in separators {
+        for y in sy0..=sy1 {
+            for x in sx0..=sx1 {
+                if y < y0 || x < x0 || y > y1 || x > x1 || x >= w || x < 0 || y < 0 {
+                    continue;
+                }
+                let src = (y * w + x) as usize;
+                if src >= mask.len() || mask[src] == 0 {
+                    continue;
+                }
+                ink[(y - y0) as usize * mw + (x - x0) as usize] = 1;
+            }
+        }
+    }
+    ink
 }
 
 struct GapInk {
@@ -731,6 +843,10 @@ struct GapInk {
     gh: i32,
     gw: i32,
     mid: i32,
+    ix0: i32,
+    iy0: i32,
+    ix1: i32,
+    iy1: i32,
     /// Ink in the top and bottom thirds with an empty middle: the two dots of a colon.
     colon_like: bool,
 }
@@ -803,11 +919,22 @@ fn inspect_gap(mask: &[u8], w: i32, x0: i32, x1: i32, y0: i32, y1: i32) -> GapIn
         gh: if ink == 0 { 0 } else { iy1 - iy0 + 1 },
         gw: if ink == 0 { 0 } else { ix1 - ix0 + 1 },
         mid: if ink == 0 { 0 } else { (iy0 + iy1) / 2 },
+        ix0,
+        iy0,
+        ix1,
+        iy1,
         colon_like,
     }
 }
 
-fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32, space_width: i32) -> Option<char> {
+fn gap_char(
+    gap: &GapInk,
+    y0: i32,
+    y1: i32,
+    line_h: i32,
+    space_at: i32,
+    space_width: i32,
+) -> Option<char> {
     let wide = if space_at >= 0 {
         space_width >= space_at
     } else {
@@ -822,7 +949,9 @@ fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32, space_wi
     // The seam through a cabinet colon stretches one dot, but the two marks
     // are still separated. A broken slot edge has only a few empty rows.
     let split_dots = gap.runs == 2 && gap.hole >= 8 && gap.max_run * 2 <= line_h;
-    if gap.width >= 8 && (short_dots || split_dots || (gap.colon_like && gap.gw * 2 <= line_h && gap.ink < 250)) {
+    if gap.width >= 8
+        && (short_dots || split_dots || (gap.colon_like && gap.gw * 2 <= line_h && gap.ink < 250))
+    {
         return Some(':');
     }
     if gap.runs == 1 {
@@ -843,7 +972,11 @@ fn gap_char(gap: &GapInk, y0: i32, y1: i32, line_h: i32, space_at: i32, space_wi
     if gap.max_run * 3 >= line_h && gap.gw * 3 <= line_h {
         return Some('\0');
     }
-    if wide { None } else { Some('\0') }
+    if wide {
+        None
+    } else {
+        Some('\0')
+    }
 }
 
 struct GlyphBmp {
@@ -891,7 +1024,13 @@ fn narrow_one(mask: &[u8], w: i32, comp: Comp) -> bool {
     let mut right = bw as usize;
     let low = 4.max(bh / 8);
     let tall = bh * 4 / 5;
-    if let Some(bar_at) = cols.iter().enumerate().rev().find(|(_, c)| **c >= tall).map(|(i, _)| i) {
+    if let Some(bar_at) = cols
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, c)| **c >= tall)
+        .map(|(i, _)| i)
+    {
         if bar_at + 5 >= cols.len() {
             let mut bar_left = bar_at;
             while bar_left > 0 && cols[bar_left - 1] > low && bar_at + 1 - (bar_left - 1) <= 4 {
@@ -953,10 +1092,14 @@ fn narrow_one(mask: &[u8], w: i32, comp: Comp) -> bool {
 
 fn trim_fringe(mask: &[u8], w: i32, mut comp: Comp) -> Comp {
     let row_ink = |y: i32, comp: Comp| -> i32 {
-        (comp.x0..=comp.x1).filter(|&x| mask[(y * w + x) as usize] != 0).count() as i32
+        (comp.x0..=comp.x1)
+            .filter(|&x| mask[(y * w + x) as usize] != 0)
+            .count() as i32
     };
     let col_ink = |x: i32, comp: Comp| -> i32 {
-        (comp.y0..=comp.y1).filter(|&y| mask[(y * w + x) as usize] != 0).count() as i32
+        (comp.y0..=comp.y1)
+            .filter(|&y| mask[(y * w + x) as usize] != 0)
+            .count() as i32
     };
     while comp.y0 < comp.y1 && row_ink(comp.y0, comp) < 3 {
         comp.y0 += 1;
@@ -975,7 +1118,11 @@ fn trim_fringe(mask: &[u8], w: i32, mut comp: Comp) -> Comp {
 
 fn classify(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> Option<char> {
     let (ch, score) = classify_scored(mask, w, comp, glyphs);
-    if score >= 0.38 { Some(ch) } else { None }
+    if score >= 0.38 {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 /// A thin stroke on a white surface is the same digit, one pixel short of the
@@ -1005,7 +1152,11 @@ fn thicken(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> Option<char>
         }
     }
     let (again, score) = classify_scored(&thick, w, comp, glyphs);
-    if again == ch && score >= 0.38 { Some(ch) } else { None }
+    if again == ch && score >= 0.38 {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 fn classify_scored(mask: &[u8], w: i32, comp: Comp, glyphs: &[GlyphBmp]) -> (char, f32) {
@@ -1030,7 +1181,9 @@ fn iou(mask: &[u8], w: i32, comp: Comp, glyph: &GlyphBmp) -> f32 {
     if dw == 0 || dh == 0 || glyph.width == 0 || glyph.height == 0 {
         return 0.0;
     }
-    let scaled_w = ((glyph.width * dh) as f32 / glyph.height as f32).round().max(1.0) as usize;
+    let scaled_w = ((glyph.width * dh) as f32 / glyph.height as f32)
+        .round()
+        .max(1.0) as usize;
     let canvas = dw.max(scaled_w);
     let src_off = (canvas - dw) / 2;
     let font_off = (canvas - scaled_w) / 2;
@@ -1058,7 +1211,11 @@ fn iou(mask: &[u8], w: i32, comp: Comp, glyph: &GlyphBmp) -> f32 {
             }
         }
     }
-    if union == 0 { 0.0 } else { inter as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f32 / union as f32
+    }
 }
 
 fn looks_like_slash(mask: &[u8], w: i32, comp: Comp) -> bool {
@@ -1148,7 +1305,16 @@ fn valid_date(year: u16, month: u8, day: u8) -> bool {
     day <= dim
 }
 
-fn format_stamp(sep: char, has_second: bool, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: Option<u8>) -> String {
+fn format_stamp(
+    sep: char,
+    has_second: bool,
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: Option<u8>,
+) -> String {
     if has_second {
         format!(
             "{year:04}{sep}{month:02}{sep}{day:02} {hour:02}:{minute:02}:{:02}",
@@ -1177,12 +1343,20 @@ fn ink_color(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> [u8; 3] {
     // The brightest quarter of the whole box is the plastic on a white duct.
     // The stroke cores are the bright pixels that stand above their neighborhood.
     let from_glyphs = glyphs.len() >= 8;
-    let pool = if from_glyphs { &mut glyphs } else { &mut samples };
+    let pool = if from_glyphs {
+        &mut glyphs
+    } else {
+        &mut samples
+    };
     if pool.is_empty() {
         return [255, 255, 255];
     }
     pool.sort_by_key(|s| s.0);
-    let start = if from_glyphs { pool.len() * 9 / 10 } else { pool.len() * 3 / 4 };
+    let start = if from_glyphs {
+        pool.len() * 9 / 10
+    } else {
+        pool.len() * 3 / 4
+    };
     let slice = &pool[start..];
     let n = slice.len().max(1) as u32;
     let mut acc = [0u32; 3];
@@ -1229,170 +1403,50 @@ fn local_median_luma(image: &RgbaImage, x: i32, y: i32) -> Option<i32> {
     Some(samples[n / 2])
 }
 
-fn background(image: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> ([u8; 3], i32) {
-    let mut samples = Vec::new();
-    for y in y0..=y1 {
-        for x in (x0 - 14)..(x0 - 2) {
-            if let Some(px) = pixel(image, x, y) {
-                samples.push(px);
-            }
-        }
-        for x in (x1 + 2)..=(x1 + 14) {
-            if let Some(px) = pixel(image, x, y) {
-                samples.push(px);
-            }
-        }
-    }
-    if samples.len() < 20 {
-        for y in (y1 + 3)..=(y1 + 10) {
-            for x in x0..=x1 {
-                if let Some(px) = pixel(image, x, y) {
-                    samples.push(px);
-                }
-            }
-        }
-    }
-    if samples.is_empty() {
-        return ([0, 0, 0], 28);
-    }
-    let mut lumas: Vec<i32> = samples.iter().map(|p| luma_of(*p)).collect();
-    lumas.sort_unstable();
-    let mid = lumas[lumas.len() / 2];
-    let mut chans = [Vec::new(), Vec::new(), Vec::new()];
-    for px in &samples {
-        for c in 0..3 {
-            chans[c].push(px[c]);
-        }
-    }
-    let mut color = [0u8; 3];
-    for c in 0..3 {
-        chans[c].sort_unstable();
-        color[c] = chans[c][chans[c].len() / 2];
-    }
-    (color, mid + 28)
-}
-
-fn erase_and_inpaint(image: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, bg: [u8; 3], cutoff: i32) {
-    let bg_luma = luma_of([bg[0], bg[1], bg[2], 255]);
-    let pad = if bg_luma >= 170 { 10 } else { 3 };
-    let x0 = (x0 - pad).max(0);
-    let y0 = (y0 - pad).max(0);
-    let x1 = (x1 + pad).min(image.width() as i32 - 1);
-    let y1 = (y1 + pad).min(image.height() as i32 - 1);
+fn erase_stamp(image: &mut RgbaImage, stamp: &Stamp) {
+    // The old fill painted every light pixel in the date box with one color.
+    // On a wall, a duct or a gradient that becomes a rectangle. Only the
+    // strokes are rebuilt, from the picture touching them.
+    let pad = 16i32;
+    let x0 = (stamp.x0 - pad).max(0);
+    let y0 = (stamp.y0 - pad).max(0);
+    let x1 = (stamp.x1 + pad).min(image.width() as i32 - 1);
+    let y1 = (stamp.y1 + pad).min(image.height() as i32 - 1);
     if x1 < x0 || y1 < y0 {
         return;
     }
     let bw = (x1 - x0 + 1) as usize;
     let bh = (y1 - y0 + 1) as usize;
     let mut rgb = vec![[0u8; 3]; bw * bh];
-    let mut hole = vec![false; bw * bh];
     for y in 0..bh {
         for x in 0..bw {
-            let px = image.get_pixel((x0 as usize + x) as u32, (y0 as usize + y) as u32).0;
-            let i = y * bw + x;
-            rgb[i] = [px[0], px[1], px[2]];
-            let lum = luma_of(px);
-            let xx = x0 + x as i32;
-            let yy = y0 + y as i32;
-            // A global cutoff catches white type on a dark photo. On a white
-            // duct the stroke is only a few levels above the plastic, so the
-            // same test the reader uses has to mark those cores as well.
-            if lum > cutoff || (lum >= 150 && above_local(image, xx, yy, lum) >= 2) {
-                hole[i] = true;
-            }
+            let px = image
+                .get_pixel((x0 as usize + x) as u32, (y0 as usize + y) as u32)
+                .0;
+            rgb[y * bw + x] = [px[0], px[1], px[2]];
         }
     }
-    // A faint stroke on white plastic blooms wider than two pixels. On a light
-    // surface, follow that glow until it falls back to the plastic, and stop
-    // at a dark groove. On a darker photo, only the fringe next to the core
-    // is removed so the picture behind the date stays.
-    if bg_luma >= 170 {
-        let mut stack = Vec::new();
-        for i in 0..hole.len() {
-            if hole[i] {
-                stack.push(i);
+    let mut hole = vec![false; bw * bh];
+    let mw = (stamp.x1 - stamp.x0 + 1).max(0) as usize;
+    let mh = (stamp.y1 - stamp.y0 + 1).max(0) as usize;
+    if mw == 0 || mh == 0 || stamp.ink.len() < mw * mh {
+        return;
+    }
+    for y in stamp.y0..=stamp.y1 {
+        for x in stamp.x0..=stamp.x1 {
+            let ix = (x - stamp.x0) as usize;
+            let iy = (y - stamp.y0) as usize;
+            if stamp.ink[iy * mw + ix] == 0 {
+                continue;
             }
-        }
-        while let Some(i) = stack.pop() {
-            let x = (i % bw) as i32;
-            let y = (i / bw) as i32;
-            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let xx = x + dx;
-                let yy = y + dy;
-                if xx < 0 || yy < 0 || xx >= bw as i32 || yy >= bh as i32 {
-                    continue;
-                }
-                let j = yy as usize * bw + xx as usize;
-                if hole[j] {
-                    continue;
-                }
-                let lum = luma_of([rgb[j][0], rgb[j][1], rgb[j][2], 255]);
-                // The stroke also leaves a shadow a little darker than the
-                // plastic. A bright-only fill keeps that outline of the old
-                // time. Deep grooves are much darker and stay.
-                if lum + 30 >= bg_luma {
-                    hole[j] = true;
-                    stack.push(j);
-                }
-            }
-        }
-    } else {
-        let core = hole.clone();
-        for y in 0..bh {
-            for x in 0..bw {
-                if !core[y * bw + x] {
-                    continue;
-                }
-                for dy in -2i32..=2 {
-                    for dx in -2i32..=2 {
-                        let xx = x as i32 + dx;
-                        let yy = y as i32 + dy;
-                        if xx >= 0 && yy >= 0 && xx < bw as i32 && yy < bh as i32 {
-                            hole[yy as usize * bw + xx as usize] = true;
-                        }
-                    }
-                }
-            }
+            hole[(y - y0) as usize * bw + (x - x0) as usize] = true;
         }
     }
-    for i in 0..hole.len() {
-        if hole[i] {
-            rgb[i] = bg;
-        }
-    }
-    for _ in 0..18 {
-        let prev = rgb.clone();
-        for y in 0..bh {
-            for x in 0..bw {
-                let i = y * bw + x;
-                if !hole[i] {
-                    continue;
-                }
-                let mut acc = [0u32; 3];
-                let mut n = 0u32;
-                for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let xx = x as i32 + dx;
-                        let yy = y as i32 + dy;
-                        if xx < 0 || yy < 0 || xx >= bw as i32 || yy >= bh as i32 {
-                            continue;
-                        }
-                        let p = prev[yy as usize * bw + xx as usize];
-                        acc[0] += p[0] as u32;
-                        acc[1] += p[1] as u32;
-                        acc[2] += p[2] as u32;
-                        n += 1;
-                    }
-                }
-                if n > 0 {
-                    rgb[i] = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8];
-                }
-            }
-        }
-    }
+    cover_stroke_fringe(&mut hole, bw, bh);
+    let blurred = box_blur(&rgb, bw, bh);
+    expand_halo(&mut hole, &rgb, bw, bh);
+    inpaint_hole(&mut rgb, &hole, bw, bh);
+    restore_texture(&mut rgb, &hole, &blurred, bw, bh);
     for y in 0..bh {
         for x in 0..bw {
             let i = y * bw + x;
@@ -1405,6 +1459,273 @@ fn erase_and_inpaint(image: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, 
             px.0[2] = rgb[i][2];
         }
     }
+}
+
+/// Drop a slot edge that the reader mask pulled into the date. A colon dot
+/// or a decimal point is only a few pixels, so size alone must not throw it away.
+fn cover_stroke_fringe(hole: &mut [bool], bw: usize, bh: usize) {
+    let seeds = hole.to_vec();
+    let mut seen = vec![false; hole.len()];
+    let mut stack = Vec::new();
+    for start in 0..hole.len() {
+        if !seeds[start] || seen[start] {
+            continue;
+        }
+        stack.clear();
+        stack.push(start);
+        seen[start] = true;
+        let mut pts = Vec::new();
+        let (mut x0, mut y0, mut x1, mut y1) = (start % bw, start / bw, start % bw, start / bw);
+        while let Some(p) = stack.pop() {
+            pts.push(p);
+            let x = p % bw;
+            let y = p / bw;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+            for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let xx = x as i32 + dx;
+                let yy = y as i32 + dy;
+                if xx < 0 || yy < 0 || xx >= bw as i32 || yy >= bh as i32 {
+                    continue;
+                }
+                let n = yy as usize * bw + xx as usize;
+                if seeds[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        let tall = y1 - y0 + 1;
+        let wide = x1 - x0 + 1;
+        // A slot edge runs the full height or width of this patch. Leave the groove.
+        if tall * 4 > bh * 3 || wide * 3 > bw {
+            for p in pts {
+                hole[p] = false;
+            }
+            continue;
+        }
+    }
+}
+
+/// The reader mask is the core. The pale edge and the soft shadow sit a few
+/// pixels outside it. Only pixels that are actually lighter or darker than the
+/// surrounding surface are taken in, so the gaps between digits stay.
+fn expand_halo(hole: &mut [bool], rgb: &[[u8; 3]], bw: usize, bh: usize) {
+    let seed = hole.to_vec();
+    let dist = manhattan(&seed, bw, bh, 10);
+    for y in 0..bh {
+        for x in 0..bw {
+            let i = y * bw + x;
+            let d = dist[i];
+            if !(1..=3).contains(&d) {
+                continue;
+            }
+            let Some(bg) = vertical_surface(rgb, bw, bh, x, y, &|j| dist[j] < 5) else {
+                continue;
+            };
+            let delta = luma_rgb(rgb[i]) - luma_rgb(bg);
+            let halo = delta >= 2 || (d == 1 && delta >= -4);
+            let shadow = (-50..=-8).contains(&delta);
+            if halo || shadow {
+                hole[i] = true;
+            }
+        }
+    }
+}
+
+fn inpaint_hole(rgb: &mut [[u8; 3]], hole: &[bool], w: usize, h: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !hole[i] {
+                continue;
+            }
+            if let Some(color) = vertical_surface(rgb, w, h, x, y, &|j| hole[j]) {
+                rgb[i] = color;
+            }
+        }
+    }
+}
+
+/// Color of the surface directly above and below the stroke. A slot or a seam
+/// sits beside the date, so a square window would mix that groove into the fill.
+fn vertical_surface(
+    rgb: &[[u8; 3]],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    skip: &impl Fn(usize) -> bool,
+) -> Option<[u8; 3]> {
+    let gather = |dir: i32| -> (Vec<[u8; 3]>, i32) {
+        let mut samples = Vec::with_capacity(4);
+        let mut first = 99i32;
+        for step in 1..48 {
+            let yy = y as i32 + dir * step;
+            if yy < 0 || yy >= h as i32 {
+                break;
+            }
+            let j = yy as usize * w + x;
+            if skip(j) {
+                continue;
+            }
+            if samples.is_empty() {
+                first = step;
+            }
+            samples.push(rgb[j]);
+            if samples.len() == 4 {
+                break;
+            }
+        }
+        (samples, first)
+    };
+    let (mut above, above_at) = gather(-1);
+    let (mut below, below_at) = gather(1);
+    if above.is_empty() && below.is_empty() {
+        return None;
+    }
+    if above.is_empty() {
+        return Some(median_rgb(&mut below));
+    }
+    if below.is_empty() {
+        return Some(median_rgb(&mut above));
+    }
+    let above_l = luma_rgb(median_rgb(&mut above.clone()));
+    let below_l = luma_rgb(median_rgb(&mut below.clone()));
+    // The knob is one side and the wall is the other. Keep the nearer side.
+    if (above_l - below_l).abs() > 28 {
+        if above_at <= below_at {
+            Some(median_rgb(&mut above))
+        } else {
+            Some(median_rgb(&mut below))
+        }
+    } else {
+        above.append(&mut below);
+        Some(median_rgb(&mut above))
+    }
+}
+
+fn median_rgb(samples: &mut [[u8; 3]]) -> [u8; 3] {
+    let mid = samples.len() / 2;
+    let mut out = [0u8; 3];
+    for channel in 0..3 {
+        samples.sort_by_key(|px| px[channel]);
+        out[channel] = samples[mid][channel];
+    }
+    out
+}
+
+fn manhattan(seed: &[bool], w: usize, h: usize, limit: i16) -> Vec<i16> {
+    let mut dist = vec![99i16; seed.len()];
+    let mut queue = std::collections::VecDeque::new();
+    for (i, on) in seed.iter().enumerate() {
+        if *on {
+            dist[i] = 0;
+            queue.push_back(i);
+        }
+    }
+    while let Some(p) = queue.pop_front() {
+        let d = dist[p];
+        if d >= limit {
+            continue;
+        }
+        let x = p % w;
+        let y = p / w;
+        for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            let xx = x as isize + dx;
+            let yy = y as isize + dy;
+            if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize {
+                continue;
+            }
+            let n = yy as usize * w + xx as usize;
+            if dist[n] > d + 1 {
+                dist[n] = d + 1;
+                queue.push_back(n);
+            }
+        }
+    }
+    dist
+}
+
+fn box_blur(rgb: &[[u8; 3]], w: usize, h: usize) -> Vec<[u8; 3]> {
+    let mut out = vec![[0u8; 3]; rgb.len()];
+    let k = 2i32;
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0u32; 3];
+            let mut n = 0u32;
+            for dy in -k..=k {
+                let yy = y as i32 + dy;
+                if yy < 0 || yy >= h as i32 {
+                    continue;
+                }
+                for dx in -k..=k {
+                    let xx = x as i32 + dx;
+                    if xx < 0 || xx >= w as i32 {
+                        continue;
+                    }
+                    let px = rgb[yy as usize * w + xx as usize];
+                    acc[0] += px[0] as u32;
+                    acc[1] += px[1] as u32;
+                    acc[2] += px[2] as u32;
+                    n += 1;
+                }
+            }
+            out[y * w + x] = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8];
+        }
+    }
+    out
+}
+
+/// The flat fill matches the color but erases grain. Copy the fine detail
+/// from a nearby patch of the same surface, above or below the stroke.
+fn restore_texture(rgb: &mut [[u8; 3]], hole: &[bool], blur: &[[u8; 3]], w: usize, h: usize) {
+    let low = rgb.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !hole[i] {
+                continue;
+            }
+            let target = luma_rgb(low[i]);
+            let mut donor = None;
+            for step in 6..28 {
+                for ny in [y as i32 - step, y as i32 + step] {
+                    if ny < 0 || ny >= h as i32 {
+                        continue;
+                    }
+                    let j = ny as usize * w + x;
+                    if hole[j] {
+                        continue;
+                    }
+                    if (luma_rgb(low[j]) - luma_rgb(blur[j])).abs() > 24 {
+                        continue;
+                    }
+                    if (luma_rgb(low[j]) - target).abs() <= 18 {
+                        donor = Some(j);
+                        break;
+                    }
+                }
+                if donor.is_some() {
+                    break;
+                }
+            }
+            let Some(j) = donor else {
+                continue;
+            };
+            for channel in 0..3 {
+                let mixed =
+                    low[i][channel] as i32 + low[j][channel] as i32 - blur[j][channel] as i32;
+                rgb[i][channel] = mixed.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+fn luma_rgb(px: [u8; 3]) -> i32 {
+    (px[0] as i32 * 30 + px[1] as i32 * 59 + px[2] as i32 * 11) / 100
 }
 
 fn px_for_height(target: u32) -> f32 {
@@ -1501,6 +1822,58 @@ mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
 
+    fn assert_only_strokes_change(image: &RgbaImage) {
+        let stamp = find_stamp(image).expect("stamp");
+        let mut erased = image.clone();
+        erase_stamp(&mut erased, &stamp);
+        let w = image.width() as i32;
+        let h = image.height() as i32;
+        let mw = (stamp.x1 - stamp.x0 + 1).max(0) as usize;
+        let mut near = vec![false; (w * h) as usize];
+        let rad = 8i32;
+        let mut ink_n = 0u32;
+        let mut ink_same = 0u32;
+        for y in stamp.y0..=stamp.y1 {
+            for x in stamp.x0..=stamp.x1 {
+                let ix = (x - stamp.x0) as usize;
+                let iy = (y - stamp.y0) as usize;
+                if stamp.ink[iy * mw + ix] == 0 {
+                    continue;
+                }
+                ink_n += 1;
+                if image.get_pixel(x as u32, y as u32).0 == erased.get_pixel(x as u32, y as u32).0 {
+                    ink_same += 1;
+                }
+                for dy in -rad..=rad {
+                    for dx in -rad..=rad {
+                        let xx = x + dx;
+                        let yy = y + dy;
+                        if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                            near[(yy * w + xx) as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let mut far = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                if near[(y * w + x) as usize] {
+                    continue;
+                }
+                if image.get_pixel(x as u32, y as u32).0 != erased.get_pixel(x as u32, y as u32).0 {
+                    far += 1;
+                }
+            }
+        }
+        assert!(ink_n > 40, "ink pixels {ink_n}");
+        assert!(
+            ink_same * 2 < ink_n,
+            "old strokes still in place {ink_same}/{ink_n}"
+        );
+        assert_eq!(far, 0, "repainted {far} pixels away from the strokes");
+    }
+
     fn painted(text: &str) -> RgbaImage {
         let mut image = RgbaImage::new(720, 220);
         for y in 0..220 {
@@ -1538,6 +1911,7 @@ mod tests {
         assert_eq!(again.text, "2026/12/01 09:30");
         assert_eq!(again.second, None);
         assert_eq!(image.get_pixel(4, 4).0, before.get_pixel(4, 4).0);
+        assert_only_strokes_change(&before);
         let mut bright = 0u32;
         for y in 70..150 {
             for x in 200..520 {
@@ -1577,7 +1951,14 @@ mod tests {
         let before = image.clone();
         let err = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: None },
+            CameraTimeValue {
+                year: 2026,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: None,
+            },
         )
         .unwrap_err();
         assert!(matches!(err, CameraTimeError::NotFound));
@@ -1590,7 +1971,14 @@ mod tests {
         let before = image.clone();
         let err = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2023, month: 2, day: 29, hour: 12, minute: 0, second: None },
+            CameraTimeValue {
+                year: 2023,
+                month: 2,
+                day: 29,
+                hour: 12,
+                minute: 0,
+                second: None,
+            },
         )
         .unwrap_err();
         assert!(matches!(err, CameraTimeError::Invalid));
@@ -1599,8 +1987,10 @@ mod tests {
 
     #[test]
     fn light_wall_stamp_with_dots_is_found() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912.jpg");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912.jpg");
         let input = crate::image_io::decode_path(&path).expect("panel photo");
+        assert_only_strokes_change(&input.rgba);
         let found = detect_camera_time(&input.rgba).expect("date on the light wall");
         assert_eq!(found.text, "2026.11.05 09:12");
         assert_eq!(found.separator, '.');
@@ -1608,7 +1998,14 @@ mod tests {
         let mut image = input.rgba.clone();
         let change = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+            CameraTimeValue {
+                year: 2026,
+                month: 12,
+                day: 1,
+                hour: 9,
+                minute: 30,
+                second: Some(45),
+            },
         )
         .unwrap();
         assert_eq!(change.original, "2026.11.05 09:12");
@@ -1629,8 +2026,10 @@ mod tests {
 
     #[test]
     fn cabinet_stamp_cut_by_a_seam_is_found() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0912-cabinet.jpg");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/20261105-0912-cabinet.jpg");
         let input = crate::image_io::decode_path(&path).expect("cabinet photo");
+        assert_only_strokes_change(&input.rgba);
         let found = detect_camera_time(&input.rgba).expect("date beside the seam");
         assert_eq!(found.text, "2026.11.05 09:12");
         assert_eq!(found.separator, '.');
@@ -1638,7 +2037,14 @@ mod tests {
         let mut image = input.rgba.clone();
         let change = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+            CameraTimeValue {
+                year: 2026,
+                month: 12,
+                day: 1,
+                hour: 9,
+                minute: 30,
+                second: Some(45),
+            },
         )
         .unwrap();
         assert_eq!(change.original, "2026.11.05 09:12");
@@ -1662,8 +2068,10 @@ mod tests {
 
     #[test]
     fn white_duct_stamp_is_found() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261105-0919-duct.jpg");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/20261105-0919-duct.jpg");
         let input = crate::image_io::decode_path(&path).expect("duct photo");
+        assert_only_strokes_change(&input.rgba);
         let found = detect_camera_time(&input.rgba).expect("date on the white duct");
         assert_eq!(found.text, "2026.11.05 09:19");
         assert_eq!(found.separator, '.');
@@ -1671,30 +2079,18 @@ mod tests {
         let mut image = input.rgba.clone();
         let change = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+            CameraTimeValue {
+                year: 2026,
+                month: 12,
+                day: 1,
+                hour: 9,
+                minute: 30,
+                second: Some(45),
+            },
         )
         .unwrap();
         assert_eq!(change.original, "2026.11.05 09:19");
         assert_eq!(change.updated, "2026.12.01 09:30");
-        let stamp = find_stamp(&input.rgba).expect("stamp box");
-        let (bg, _) = background(&input.rgba, stamp.x0, stamp.y0, stamp.x1, stamp.y1);
-        let bg_l = luma_of([bg[0], bg[1], bg[2], 255]);
-        let mut stroke = 0u32;
-        let mut leftover = 0u32;
-        for y in stamp.y0..=stamp.y1 {
-            for x in stamp.x0..=stamp.x1 {
-                let before = input.rgba.get_pixel(x as u32, y as u32).0;
-                if luma_of(before) + 25 < bg_l {
-                    continue;
-                }
-                stroke += 1;
-                if image.get_pixel(x as u32, y as u32).0 == before {
-                    leftover += 1;
-                }
-            }
-        }
-        assert!(stroke > 1000, "stroke pixels {stroke}");
-        assert!(leftover * 5 < stroke, "old time still in place {leftover}/{stroke}");
         if let Some(again) = detect_camera_time(&image) {
             assert_eq!(again.text, "2026.12.01 09:30");
             assert_eq!(again.separator, '.');
@@ -1712,15 +2108,24 @@ mod tests {
 
     #[test]
     fn sample_photo_date_can_be_rewritten() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261119-092612.jpg");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/20261119-092612.jpg");
         let input = crate::image_io::decode_path(&path).expect("sample");
+        assert_only_strokes_change(&input.rgba);
         let found = detect_camera_time(&input.rgba).expect("huawei date");
         assert_eq!(found.text, "2026/11/15 16:08");
         assert_eq!(found.second, None);
         let mut image = input.rgba.clone();
         let change = edit_camera_time(
             &mut image,
-            CameraTimeValue { year: 2026, month: 12, day: 1, hour: 9, minute: 30, second: Some(45) },
+            CameraTimeValue {
+                year: 2026,
+                month: 12,
+                day: 1,
+                hour: 9,
+                minute: 30,
+                second: Some(45),
+            },
         )
         .unwrap();
         assert_eq!(change.updated, "2026/12/01 09:30");
@@ -1743,9 +2148,16 @@ mod tests {
     #[test]
     fn date_edit_leaves_the_doubao_result_and_the_model_line() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let templates = crate::template::load_template_dir(&root.join("resources/doubao")).expect("templates");
-        let input = crate::image_io::decode_path(&root.join("docs/20261119-092612.jpg")).expect("sample");
-        let off = crate::restore::process_best(&input, &templates, &crate::restore::ProcessOptions::default()).unwrap();
+        let templates =
+            crate::template::load_template_dir(&root.join("resources/doubao")).expect("templates");
+        let input =
+            crate::image_io::decode_path(&root.join("docs/20261119-092612.jpg")).expect("sample");
+        let off = crate::restore::process_best(
+            &input,
+            &templates,
+            &crate::restore::ProcessOptions::default(),
+        )
+        .unwrap();
         let on = crate::restore::process_best(
             &input,
             &templates,
@@ -1763,16 +2175,27 @@ mod tests {
         )
         .unwrap();
         assert!(off.report.camera_time.is_none());
-        assert!(!off.report.flags.iter().any(|flag| flag.starts_with("camera_time")));
+        assert!(!off
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag.starts_with("camera_time")));
         assert_eq!(off.report.counts.outside_diff_pixels, 0);
         assert_eq!(on.report.counts.outside_diff_pixels, 0);
         let change = on.report.camera_time.expect("edited");
         assert_eq!(change.original, "2026/11/15 16:08");
         assert_eq!(change.updated, "2026/12/01 09:30");
-        assert!(on.report.flags.iter().any(|flag| flag == "camera_time_edited"));
+        assert!(on
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_edited"));
         let off_img = off.image.expect("restored");
         let on_img = on.image.expect("restored with date");
-        assert_eq!(on_img.get_pixel(900, 1510).0, input.rgba.get_pixel(900, 1510).0);
+        assert_eq!(
+            on_img.get_pixel(900, 1510).0,
+            input.rgba.get_pixel(900, 1510).0
+        );
         let [x, y, w, h] = on.report.bbox.expect("doubao box");
         for py in y..y + h {
             for px in x..x + w {
@@ -1818,9 +2241,11 @@ mod tests {
         let change = out.report.camera_time.expect("edited");
         assert_eq!(change.original, "2026/11/15 16:08");
         assert_eq!(change.updated, "2026/12/01 09:30");
-        assert!(!out.report.flags.iter().any(|flag| {
-            flag == "camera_time_skipped" || flag == "watermark_not_written"
-        }));
+        assert!(!out
+            .report
+            .flags
+            .iter()
+            .any(|flag| { flag == "camera_time_skipped" || flag == "watermark_not_written" }));
         let image = out.image.expect("time only");
         assert_eq!(image.get_pixel(8, 8).0, [1, 2, 3, 255]);
         let again = detect_camera_time(&image).expect("rewritten");
@@ -1857,15 +2282,30 @@ mod tests {
         assert!(out.encoded.is_none());
         assert!(out.report.output.is_none());
         assert_eq!(out.report.verdict, crate::Verdict::NeedsReview);
-        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_missing"));
-        assert!(!out.report.flags.iter().any(|flag| flag == "camera_time_edited"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_missing"));
+        assert!(!out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_edited"));
     }
 
     #[test]
     fn held_watermark_still_writes_the_time_on_the_original() {
         let demo = crate::fixture::demo();
         let mut rgba = demo.watermarked.clone();
-        draw_text(&mut rgba, "2026/11/15 16:08", 220, 80, 32.0, [255, 255, 255]);
+        draw_text(
+            &mut rgba,
+            "2026/11/15 16:08",
+            220,
+            80,
+            32.0,
+            [255, 255, 255],
+        );
         let mut template = demo.template.clone();
         template.meta.ncc_auto = 1.01;
         template.meta.ncc_confirm = 0.0;
@@ -1892,10 +2332,26 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.report.flags.iter().any(|flag| flag == "confirmation_required"));
-        assert!(out.report.flags.iter().any(|flag| flag == "watermark_not_written"));
-        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_edited"));
-        assert!(!out.report.flags.iter().any(|flag| flag == "camera_time_skipped"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "confirmation_required"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "watermark_not_written"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_edited"));
+        assert!(!out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_skipped"));
         let image = out.image.expect("time file");
         let change = out.report.camera_time.expect("edited");
         assert_eq!(change.updated, "2026/12/01 09:30");
@@ -1948,8 +2404,20 @@ mod tests {
         .unwrap();
         assert!(out.image.is_none());
         assert!(out.encoded.is_none());
-        assert!(out.report.flags.iter().any(|flag| flag == "camera_time_missing"));
-        assert!(out.report.flags.iter().any(|flag| flag == "confirmation_required"));
-        assert!(!out.report.flags.iter().any(|flag| flag == "watermark_not_written"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "camera_time_missing"));
+        assert!(out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "confirmation_required"));
+        assert!(!out
+            .report
+            .flags
+            .iter()
+            .any(|flag| flag == "watermark_not_written"));
     }
 }
